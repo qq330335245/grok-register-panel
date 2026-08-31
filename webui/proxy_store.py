@@ -78,6 +78,16 @@ class ProxyValidationError(ValueError):
     pass
 
 
+STICKY_PLACEHOLDERS = re.compile(r"\{(account|email|id)\}", re.I)
+STICKY_SENTINELS = {
+    "account": "GROKSTICKYACCOUNT",
+    "email": "GROKSTICKYEMAIL",
+    "id": "GROKSTICKYID",
+}
+STICKY_PROBE_ACCOUNT = "grok-register-probe"
+_STICKY_USERNAME_SAFE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-+{}"
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -143,13 +153,11 @@ def note_proxy_exit(url: object, exit_ip: object) -> bool:
     changed = False
     with exclusive_file_lock(LOCK_PATH):
         state, _ = _read_unlocked()
-        for item in state["items"]:
-            if item["url"] != normalized:
-                continue
+        item = _find_item(state, url)
+        if item is not None:
             item["exit_ip"] = _clean_text(ip, 64)
             item["last_used_at"] = _utc_now()
             changed = True
-            break
         if changed:
             _write_unlocked(state)
     return changed
@@ -171,6 +179,7 @@ def worker_proxy_details() -> list[dict]:
                     "last_used_at": str(item.get("last_used_at") or ""),
                     "status": item.get("status") or "",
                     "home": is_home_proxy(item["url"]),
+                    "sticky": is_sticky_template(item["url"]),
                 }
             )
         if changed:
@@ -251,6 +260,114 @@ def _safe_int(value: object, default: int = 0) -> int:
         return default
 
 
+def is_sticky_template(url: object) -> bool:
+    return bool(STICKY_PLACEHOLDERS.search(str(url or "")))
+
+
+def sticky_account_key(value: object) -> str:
+    """Align with grok2api: keep letters, digits, _, -, +; map the rest to _."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    mapped = []
+    for char in text:
+        if char.isalnum() or char in "_-+" :
+            mapped.append(char)
+        else:
+            mapped.append("_")
+    key = "".join(mapped)
+    if len(key) <= 128:
+        return key
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return f"{key[:95]}_{digest}"
+
+
+def expand_proxy_url(
+    url: object,
+    *,
+    email: object = "",
+    account: object = "",
+    account_id: object = "",
+) -> str:
+    raw = str(url or "").strip()
+    if not raw or not is_sticky_template(raw):
+        return raw
+    email_key = sticky_account_key(email)
+    account_key = sticky_account_key(account) or email_key
+    id_key = sticky_account_key(account_id) or account_key or email_key
+    if not (account_key or email_key or id_key):
+        raise ProxyValidationError("粘性代理需要有效的账号身份")
+
+    def _repl(match: re.Match[str]) -> str:
+        kind = str(match.group(1) or "").lower()
+        if kind == "id":
+            return id_key or account_key or email_key
+        if kind == "email":
+            return email_key or account_key or id_key
+        return account_key or email_key or id_key
+
+    return STICKY_PLACEHOLDERS.sub(_repl, raw)
+
+
+def _encode_sticky_sentinels(value: str) -> str:
+    def _repl(match: re.Match[str]) -> str:
+        kind = str(match.group(1) or "").lower()
+        return STICKY_SENTINELS.get(kind, match.group(0))
+    return STICKY_PLACEHOLDERS.sub(_repl, value)
+
+
+def _decode_sticky_sentinels(value: str) -> str:
+    text = str(value or "")
+    for kind, sentinel in STICKY_SENTINELS.items():
+        text = text.replace(sentinel, "{" + kind + "}")
+    return text
+
+
+def _username_matches_template(template_user: str, actual_user: str) -> bool:
+    if template_user == actual_user:
+        return True
+    if not is_sticky_template(template_user):
+        return False
+    parts: list[str] = []
+    last = 0
+    for match in STICKY_PLACEHOLDERS.finditer(template_user):
+        parts.append(re.escape(template_user[last:match.start()]))
+        parts.append(r"[A-Za-z0-9_+-]{1,128}")
+        last = match.end()
+    parts.append(re.escape(template_user[last:]))
+    return bool(re.fullmatch("".join(parts), actual_user or ""))
+
+
+def same_proxy_node(stored: object, used: object) -> bool:
+    try:
+        left = normalize_proxy(stored)
+        right = normalize_proxy(used)
+    except ProxyValidationError:
+        return False
+    if left == right:
+        return True
+    left_parts = urlsplit(_encode_sticky_sentinels(left))
+    right_parts = urlsplit(_encode_sticky_sentinels(right))
+    if (
+        left_parts.scheme != right_parts.scheme
+        or (left_parts.hostname or "").lower() != (right_parts.hostname or "").lower()
+        or left_parts.port != right_parts.port
+        or unquote(left_parts.password or "") != unquote(right_parts.password or "")
+    ):
+        return False
+    return _username_matches_template(
+        _decode_sticky_sentinels(unquote(left_parts.username or "")),
+        _decode_sticky_sentinels(unquote(right_parts.username or "")),
+    )
+
+
+def _find_item(state: dict, url: object):
+    for item in state.get("items") or []:
+        if same_proxy_node(item.get("url"), url):
+            return item
+    return None
+
+
 def normalize_proxy(value: object) -> str:
     """Return a canonical proxy URL without ever logging the input value."""
     raw = str(value or "").strip()
@@ -258,6 +375,8 @@ def normalize_proxy(value: object) -> str:
         raise ProxyValidationError("代理地址为空")
     if any(char.isspace() for char in raw):
         raise ProxyValidationError("代理地址不能包含空白字符")
+    if any(sentinel in raw for sentinel in STICKY_SENTINELS.values()):
+        raise ProxyValidationError("代理地址包含保留的粘性占位符文本")
 
     if "://" not in raw:
         parts = raw.split(":")
@@ -269,15 +388,14 @@ def normalize_proxy(value: object) -> str:
             password = ":".join(parts[3:])
             if not username or not password:
                 raise ProxyValidationError("代理账号或密码为空")
-            raw = (
-                f"http://{quote(username, safe='')}:{quote(password, safe='')}"
-                f"@{host}:{port}"
-            )
+            user_q = quote(_encode_sticky_sentinels(username), safe=_STICKY_USERNAME_SAFE)
+            raw = f"http://{user_q}:{quote(password, safe='')}@{host}:{port}"
         else:
             raise ProxyValidationError("格式应为 URL、host:port 或 host:port:user:pass")
 
+    parse_value = _encode_sticky_sentinels(raw)
     try:
-        parsed = urlsplit(raw)
+        parsed = urlsplit(parse_value)
         scheme = parsed.scheme.lower()
         if scheme not in ALLOWED_SCHEMES:
             raise ProxyValidationError("仅支持 http、https、socks5、socks5h")
@@ -292,21 +410,35 @@ def normalize_proxy(value: object) -> str:
         if port is None or not 1 <= port <= 65535:
             raise ProxyValidationError("代理端口必须在 1-65535 之间")
 
-        host = parsed.hostname.lower().rstrip(".")
+        host_raw = str(parsed.hostname or "")
+        host_decoded = _decode_sticky_sentinels(host_raw)
+        password = _decode_sticky_sentinels(unquote(parsed.password or ""))
+        username = _decode_sticky_sentinels(unquote(parsed.username or ""))
+        if is_sticky_template(host_decoded) or any(
+            host_raw.lower() == sentinel.lower() for sentinel in STICKY_SENTINELS.values()
+        ):
+            raise ProxyValidationError("{account} / {email} / {id} 只能用于代理认证用户名")
+        if is_sticky_template(password) or is_sticky_template(str(port)):
+            raise ProxyValidationError("{account} / {email} / {id} 只能用于代理认证用户名")
+        host = host_raw.lower().rstrip(".")
         if not host:
             raise ProxyValidationError("缺少代理主机")
         if ":" in host:
             host = f"[{host}]"
-
-        username = unquote(parsed.username or "")
-        password = unquote(parsed.password or "")
         if (parsed.username is None) != (parsed.password is None):
             raise ProxyValidationError("代理账号和密码必须同时填写")
         auth = ""
         if parsed.username is not None:
             if not username or not password:
                 raise ProxyValidationError("代理账号或密码为空")
-            auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+            if is_sticky_template(username):
+                auth = (
+                    f"{quote(_encode_sticky_sentinels(username), safe=_STICKY_USERNAME_SAFE)}"
+                    f":{quote(password, safe='')}@"
+                )
+                auth = _decode_sticky_sentinels(auth)
+            else:
+                auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
         return f"{scheme}://{auth}{host}:{port}"
     except ProxyValidationError:
         raise
@@ -470,6 +602,8 @@ def _public_item(item: dict, testing_ids: set[str], now: datetime) -> dict:
         "risk_count": item.get("risk_count", 0),
         "source": item.get("source") or "panel",
         "created_at": item.get("created_at") or "",
+        "sticky": is_sticky_template(item["url"]),
+        "sticky_user": unquote(parsed.username or "") if is_sticky_template(item["url"]) else "",
     }
 
 
@@ -669,11 +803,10 @@ def mark_proxy_used(url: object) -> bool:
     changed = False
     with exclusive_file_lock(LOCK_PATH):
         state, _ = _read_unlocked()
-        for item in state["items"]:
-            if item["url"] == normalized:
-                item["last_used_at"] = _utc_now()
-                changed = True
-                break
+        item = _find_item(state, url)
+        if item is not None:
+            item["last_used_at"] = _utc_now()
+            changed = True
         if changed:
             _write_unlocked(state)
     return changed
@@ -691,9 +824,8 @@ def record_proxy_result(url: object, outcome: str, error: object = "") -> bool:
     changed = False
     with exclusive_file_lock(LOCK_PATH):
         state, _ = _read_unlocked()
-        for item in state["items"]:
-            if item["url"] != normalized:
-                continue
+        item = _find_item(state, url)
+        if item is not None:
             changed = True
             item["last_used_at"] = _utc_now()
             if outcome == "success":
@@ -702,7 +834,7 @@ def record_proxy_result(url: object, outcome: str, error: object = "") -> bool:
                 item["last_error"] = ""
                 item["cooldown_until"] = ""
                 item["cooldown_reason"] = ""
-            elif outcome == "risk" and is_home_proxy(normalized):
+            elif outcome == "risk" and is_home_proxy(item.get("url") or normalized):
                 # 家宽风控：只记账，不冷却、不禁用；换口靠 40 分钟 IP 去重
                 item["risk_count"] += 1
                 item["failure_count"] += 1
@@ -724,7 +856,6 @@ def record_proxy_result(url: object, outcome: str, error: object = "") -> bool:
                 else:
                     item["cooldown_reason"] = "network"
                     item["cooldown_until"] = _future_utc(NETWORK_COOLDOWN_SECONDS)
-            break
         if changed:
             _write_unlocked(state)
     return changed
@@ -761,7 +892,12 @@ def _parse_probe_payload(payload: object) -> tuple[str, int | None, str]:
 
 def probe_xai_signup(url: object, timeout: float = DEFAULT_TEST_TIMEOUT, *, http_get=None) -> str:
     """Require the proxy to reach the actual registration page, not only an IP API."""
-    normalized = normalize_proxy(url)
+    normalized = expand_proxy_url(
+        normalize_proxy(url),
+        email=STICKY_PROBE_ACCOUNT,
+        account=STICKY_PROBE_ACCOUNT,
+        account_id=STICKY_PROBE_ACCOUNT,
+    )
     timeout = max(2.0, min(float(timeout), 20.0))
     from connectivity import check_xai_signup
 
@@ -781,7 +917,12 @@ def probe_xai_signup(url: object, timeout: float = DEFAULT_TEST_TIMEOUT, *, http
 
 def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
     """Probe one proxy via public IP services and return non-secret metadata."""
-    normalized = normalize_proxy(url)
+    normalized = expand_proxy_url(
+        normalize_proxy(url),
+        email=STICKY_PROBE_ACCOUNT,
+        account=STICKY_PROBE_ACCOUNT,
+        account_id=STICKY_PROBE_ACCOUNT,
+    )
     timeout = max(2.0, min(float(timeout), 20.0))
     import requests
 

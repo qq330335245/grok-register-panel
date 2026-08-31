@@ -61,6 +61,8 @@ from secure_files import (
 )
 from webui.proxy_store import (
     IP_FRESH_SECONDS as _PROXY_IP_FRESH_SECONDS,
+    expand_proxy_url as _expand_proxy_url,
+    is_sticky_template as _is_sticky_template,
     mark_proxy_used as _mark_managed_proxy_used,
     note_proxy_exit as _note_managed_proxy_exit,
     record_proxy_result as _record_managed_proxy_result,
@@ -640,6 +642,7 @@ _proxy_pool_lock = threading.Lock()
 _proxy_pool_source = "none"
 _proxy_leases: dict = {}
 _proxy_lease_lock = threading.Lock()
+_mailbox_tls = threading.local()
 _submit_slot_lock = threading.Lock()
 _next_submit_at = 0.0
 # 各窗口提交邮箱至少隔这么久，避免同时打 xAI 验证码
@@ -710,6 +713,47 @@ def get_thread_proxy() -> str:
     return str(getattr(_proxy_tls, "proxy", "") or "").strip()
 
 
+def _stash_mailbox(email, token) -> None:
+    _mailbox_tls.pending = (email, token)
+
+
+def _take_stashed_mailbox():
+    pending = getattr(_mailbox_tls, "pending", None)
+    _mailbox_tls.pending = None
+    return pending
+
+
+def discard_pending_account_mailbox(log_callback=None) -> None:
+    _take_stashed_mailbox()
+    release_active_icloud_lease(reason="proxy_boot", log_callback=log_callback)
+
+
+def bind_account_proxy(template: str, email: str = "") -> str:
+    url = str(template or "").strip()
+    if email and _is_sticky_template(url):
+        url = _expand_proxy_url(url, email=email, account=email, account_id=email)
+    set_thread_proxy(url)
+    return url
+
+
+def assign_worker_proxy(worker_id: int, rotate_idx: int = 0, log_callback=None) -> str:
+    """Pick a pool node and expand grok2api-style {account}/{email}/{id} templates."""
+    template = pick_proxy_for_worker(worker_id, rotate_idx)
+    if not _is_sticky_template(template):
+        set_thread_proxy(template)
+        if log_callback:
+            log_callback(f"[*] 绑定代理: {redact_proxy(template) or '直连'}")
+        return template
+    email, token = get_email_and_token()
+    _stash_mailbox(email, token)
+    proxy = bind_account_proxy(template, email)
+    if log_callback:
+        log_callback(
+            f"[*] 动态粘性代理已按邮箱展开: {redact_proxy(proxy) or '直连'}"
+        )
+    return proxy
+
+
 def release_proxy_lease(worker_id: int | None = None) -> None:
     """释放某个 worker 占用的出口；worker_id 为空则清空。"""
     with _proxy_lease_lock:
@@ -758,13 +802,19 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
     fresh = max(60, int(_PROXY_IP_FRESH_SECONDS or 2400))
     with _proxy_lease_lock:
         current = _proxy_leases.get(wid)
-        others = {url for owner, url in _proxy_leases.items() if owner != wid}
+        others = {
+            url
+            for owner, url in _proxy_leases.items()
+            if owner != wid and not _is_sticky_template(url)
+        }
         avoid = set(others)
-        if current and (_age(current) < fresh or rot > 0):
+        if current and not _is_sticky_template(current) and (_age(current) < fresh or rot > 0):
             avoid.add(current)
-        # 同 IP 也避开（两条口偶发同一 sticky）
+        # 同 IP 也避开（两条口偶发同一 sticky）；动态粘性模板按账号展开，不互斥
         hot_ips = set()
         for url, row in by_url.items():
+            if _is_sticky_template(url) or bool(row.get("sticky")):
+                continue
             ip = str(row.get("exit_ip") or "").strip()
             if ip and _age(url) < fresh:
                 hot_ips.add(ip)
@@ -772,7 +822,11 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
         for offset, cand in enumerate(pool):
             if cand in avoid:
                 continue
-            ip = str((by_url.get(cand) or {}).get("exit_ip") or "").strip()
+            row = by_url.get(cand) or {}
+            if _is_sticky_template(cand) or bool(row.get("sticky")):
+                ranked.append((-_age(cand), offset, cand))
+                continue
+            ip = str(row.get("exit_ip") or "").strip()
             if ip and ip in hot_ips and cand != current:
                 continue
             ranked.append((-_age(cand), offset, cand))
@@ -2046,6 +2100,9 @@ def icloud_get_oai_code(
 
 
 def get_email_and_token(api_key=None):
+    stashed = _take_stashed_mailbox()
+    if stashed:
+        return stashed
     provider = get_email_provider()
     managed_domain = _managed_domain_for_provider(provider)
     if provider == "yyds":
@@ -4011,9 +4068,12 @@ class GrokRegisterGUI:
                 self.log(text)
 
         try:
+            rotate_idx = 0
             try:
+                assign_worker_proxy(worker_id, rotate_idx, wlog)
                 start_browser(log_callback=wlog)
             except Exception as boot_exc:
+                discard_pending_account_mailbox(wlog)
                 streak = get_start_fail_streak()
                 wlog(
                     f"[-] 浏览器启动失败 (连续失败 {streak}): "
@@ -4203,6 +4263,15 @@ class GrokRegisterGUI:
                     if self.should_stop():
                         break
                     wlog(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
+                try:
+                    rotate_idx += 1
+                    assign_worker_proxy(worker_id, rotate_idx, wlog)
+                except Exception as proxy_exc:
+                    wlog(
+                        f"[-] 下号没有可用代理: "
+                        f"{redact_sensitive_log_line(str(proxy_exc))}"
+                    )
+                    break
         except RegistrationCancelled:
             wlog("[!] 注册被用户停止")
         except Exception as exc:
@@ -4344,7 +4413,11 @@ def run_registration_cli(count):
             rotate_idx = 0
             try:
                 try:
-                    px = pick_proxy_for_worker(wid, rotate_idx)
+                    px = assign_worker_proxy(
+                        wid,
+                        rotate_idx,
+                        lambda m: cli_log(f"[W{wid+1}] {m}"),
+                    )
                 except Exception as proxy_exc:
                     local_fail = n
                     local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
@@ -4353,12 +4426,13 @@ def run_registration_cli(count):
                         f"{redact_sensitive_log_line(str(proxy_exc))}"
                     )
                     return
-                set_thread_proxy(px)
-                cli_log(f"[W{wid+1}] [*] 绑定代理: {redact_proxy(px)}")
                 try:
                     start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                 except Exception as boot_exc:
                     record_proxy_boot_failure(px, boot_exc)
+                    discard_pending_account_mailbox(
+                        lambda m: cli_log(f"[W{wid+1}] {m}")
+                    )
                     # 黑名单/死代理：多换几条 sticky 再放弃
                     booted = False
                     last_boot = boot_exc
@@ -4373,8 +4447,14 @@ def run_registration_cli(count):
                             break
                         rotate_idx += 1
                         try:
-                            px = pick_proxy_for_worker(wid, rotate_idx)
-                            set_thread_proxy(px)
+                            discard_pending_account_mailbox(
+                                lambda m: cli_log(f"[W{wid+1}] {m}")
+                            )
+                            px = assign_worker_proxy(
+                                wid,
+                                rotate_idx,
+                                lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            )
                             cli_log(
                                 f"[W{wid+1}] [*] 跳过坏出口，换代理 #{rotate_idx}: "
                                 f"{redact_proxy(px)} ({redact_sensitive_log_line(msgb[:80])})"
@@ -4652,14 +4732,19 @@ def run_registration_cli(count):
                             except Exception:
                                 pass
                             try:
-                                px = pick_proxy_for_worker(wid, rotate_idx)
-                                set_thread_proxy(px)
-                                cli_log(f"[W{wid+1}] [*] 下号代理: {redact_proxy(px)}")
+                                px = assign_worker_proxy(
+                                    wid,
+                                    rotate_idx,
+                                    lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                )
                                 start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
                                 time.sleep(0.5)
                             except Exception as boot_exc:
                                 last_boot = boot_exc
                                 record_proxy_boot_failure(px, boot_exc)
+                                discard_pending_account_mailbox(
+                                    lambda m: cli_log(f"[W{wid+1}] {m}")
+                                )
                                 if "面板代理池没有健康且启用的代理" in str(boot_exc):
                                     remaining = max(n - i, 0)
                                     local_fail += remaining
@@ -4682,8 +4767,14 @@ def run_registration_cli(count):
                                             break
                                         rotate_idx += 1
                                         try:
-                                            px = pick_proxy_for_worker(wid, rotate_idx)
-                                            set_thread_proxy(px)
+                                            discard_pending_account_mailbox(
+                                                lambda m: cli_log(f"[W{wid+1}] {m}")
+                                            )
+                                            px = assign_worker_proxy(
+                                                wid,
+                                                rotate_idx,
+                                                lambda m: cli_log(f"[W{wid+1}] {m}"),
+                                            )
                                             cli_log(
                                                 f"[W{wid+1}] [*] 下号跳过黑名单，换 #{rotate_idx}: "
                                                 f"{redact_proxy(px)}"
@@ -4758,15 +4849,14 @@ def run_registration_cli(count):
         for _boot_try in range(boot_attempts):
             px = ""
             try:
-                px = pick_proxy_for_worker(0, single_rotate_idx)
-                set_thread_proxy(px)
-                cli_log(f"[*] 绑定代理: {redact_proxy(px) or '直连'}")
+                px = assign_worker_proxy(0, single_rotate_idx, cli_log)
                 start_browser(log_callback=cli_log)
                 last_boot = None
                 break
             except Exception as boot_exc:
                 last_boot = boot_exc
                 record_proxy_boot_failure(px, boot_exc)
+                discard_pending_account_mailbox(cli_log)
                 single_rotate_idx += 1
         if last_boot is not None:
             fail_count += count
@@ -5015,9 +5105,7 @@ def run_registration_cli(count):
                     break
                 cli_log(f"[Debug] 轮次关闭浏览器失败: {close_exc}")
             try:
-                px = pick_proxy_for_worker(0, single_rotate_idx)
-                set_thread_proxy(px)
-                cli_log(f"[*] 下号代理: {redact_proxy(px) or '直连'}")
+                px = assign_worker_proxy(0, single_rotate_idx, cli_log)
             except Exception as proxy_exc:
                 cli_log(
                     f"[-] 下号没有可用代理: "

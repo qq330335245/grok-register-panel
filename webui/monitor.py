@@ -2156,9 +2156,9 @@ HTML = r"""<!DOCTYPE html>
             <summary>调用模型提示 permission-denied</summary>
             <div class="faq-answer">常见原因是 token 缺少 <code>referrer=grok-build</code>，或 <code>base_url</code> 指向了 <code>api.x.ai</code>。使用项目的 Authorization Code + PKCE 流程重新生成，并指向 Build 通道。</div>
           </details>
-          <details class="faq-item" data-faq-item data-search="出口 ip 代理 无法解析 流量 住宅 链式 dialer">
+          <details class="faq-item" data-faq-item data-search="出口 ip 代理 无法解析 流量 住宅 链式 dialer 粘性 account email socks5h">
             <summary>无法解析出口 IP，或代理流量消耗很高</summary>
-            <div class="faq-answer">先单独测试代理端口是否可用。住宅代理可能同时计算上下行流量，实际每 GB 产出没有固定值；降低并发并避免重复失败重试。链式代理应在代理客户端配置。</div>
+            <div class="faq-answer">先单独测试代理端口是否可用。住宅代理可能同时计算上下行流量，实际每 GB 产出没有固定值；降低并发并避免重复失败重试。链式代理应在代理客户端配置。动态粘性可把 grok2api 同款模板写入代理池，用户名使用 {account} / {email} / {id}；注册时按邮箱展开，探测用占位账号，不要把 @ 编成 %40。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="邮箱 api 401 超时 cloudflare workers key auth_mode proxy">
             <summary>邮箱 API 返回 401 或请求超时</summary>
@@ -2215,7 +2215,7 @@ HTML = r"""<!DOCTYPE html>
           <textarea id="proxy-input" spellcheck="false" autocomplete="off" placeholder="http://user:password@host:port&#10;host:port:user:password"></textarea>
         </div>
         <div class="proxy-import-actions">
-          <p class="proxy-format">支持 http、https、socks5、socks5h，以及 host:port:user:password。导入后先检测，只有健康且启用的代理会分配给新账号。</p>
+          <p class="proxy-format">支持 http、https、socks5、socks5h，以及 host:port:user:password。用户名可含 {account} / {email} / {id}，按 grok2api 规则展开为动态粘性会话。导入后先检测，只有健康且启用的代理会分配给新账号。</p>
           <div class="button-group">
             <button class="primary" id="proxy-import-button" onclick="importProxyInput()">导入代理</button>
             <button id="proxy-legacy-button" onclick="importLegacyProxies()">导入 proxies.txt</button>
@@ -2910,7 +2910,7 @@ function renderProxyPool(data) {
     const count = (item.failure_count || 0) > 0 ? `<div class="proxy-meta">失败 ${esc(item.failure_count)} / 风控 ${esc(item.risk_count || 0)}</div>` : "";
     return `<tr>
       <td><span class="proxy-state ${stateClass}">${esc(proxyStatusLabel(status))}</span></td>
-      <td><div class="mono proxy-endpoint">${esc(item.display_url || "")}</div><div class="proxy-meta">${item.has_auth ? "凭据已隐藏" : "无鉴权"} / ${esc(item.source || "panel")}</div></td>
+      <td><div class="mono proxy-endpoint">${esc(item.display_url || "")}</div><div class="proxy-meta">${item.sticky ? ("动态粘性 " + esc(item.sticky_user || "{account}")) : (item.has_auth ? "凭据已隐藏" : "无鉴权")} / ${esc(item.source || "panel")}</div></td>
       <td><div class="mono">${exit}</div><div class="proxy-meta mono">${asn}</div>${org}</td>
       <td class="mono">${latency}</td>
       <td title="${esc(item.last_error || "")}">${esc(detail)}${count}</td>

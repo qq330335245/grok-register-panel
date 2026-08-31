@@ -33,6 +33,64 @@ class IsolatedStore:
         self.temp.cleanup()
 
 
+def test_sticky_template_normalize_expand_and_probe_identity():
+    template = "socks5h://g2a.{account}:token@resin.example:2260"
+    assert proxy_store.is_sticky_template(template)
+    assert (
+        proxy_store.normalize_proxy(template)
+        == "socks5h://g2a.{account}:token@resin.example:2260"
+    )
+    assert (
+        proxy_store.normalize_proxy("resin.example:2260:g2a.{account}:token")
+        == "http://g2a.{account}:token@resin.example:2260"
+    )
+    expanded = proxy_store.expand_proxy_url(
+        template,
+        email="foo@bar.com",
+        account="foo@bar.com",
+        account_id="foo@bar.com",
+    )
+    assert expanded == "socks5h://g2a.foo_bar_com:token@resin.example:2260"
+    assert "+" in proxy_store.sticky_account_key("a+b@x.com")
+    assert proxy_store.same_proxy_node(template, expanded)
+    try:
+        proxy_store.expand_proxy_url(template, email="", account_id="")
+    except proxy_store.ProxyValidationError:
+        pass
+    else:
+        raise AssertionError("empty sticky identity must fail")
+    try:
+        proxy_store.normalize_proxy("socks5h://user:token@{account}:2260")
+    except proxy_store.ProxyValidationError:
+        pass
+    else:
+        raise AssertionError("placeholder outside username must fail")
+
+    with IsolatedStore():
+        imported = proxy_store.import_proxies(template)
+        assert imported["ok"] is True
+        assert imported["items"][0]["sticky"] is True
+        assert imported["items"][0]["sticky_user"] == "g2a.{account}"
+        proxy_id = imported["imported_ids"][0]
+        proxy_store._apply_probe_result(
+            proxy_id,
+            {
+                "ok": True,
+                "exit_ip": "203.0.113.50",
+                "asn": 64500,
+                "asn_org": "Sticky",
+                "latency_ms": 80,
+                "checked_at": "2026-08-31T00:00:00Z",
+            },
+        )
+        usable = proxy_store.list_worker_proxies()
+        assert usable == [template]
+        assert proxy_store.record_proxy_result(expanded, "success")
+        public = proxy_store.read_proxy_pool()["items"][0]
+        assert public["success_count"] == 1
+        assert public["sticky"] is True
+
+
 def test_normalize_proxy_formats_and_rejects_paths():
     assert proxy_store.normalize_proxy("proxy.example:8080") == "http://proxy.example:8080"
     assert (
@@ -276,6 +334,7 @@ def test_async_probe_job_persists_health():
 
 
 if __name__ == "__main__":
+    test_sticky_template_normalize_expand_and_probe_identity()
     test_normalize_proxy_formats_and_rejects_paths()
     test_import_deduplicates_and_public_view_never_leaks_credentials()
     test_probe_result_and_runtime_cooldown_control_worker_selection()

@@ -2126,7 +2126,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="faq-grid" id="faq-grid">
           <details class="faq-item" data-faq-item data-search="令牌 token unauthorized 401 保存设置 启动">
             <summary>提示访问令牌不匹配或 401</summary>
-            <div class="faq-answer">重新输入当前面板令牌并保存。令牌只保存在当前浏览器的 localStorage 中，换端口、设备或浏览器后需要重新输入。</div>
+            <div class="faq-answer">本机或 SSH 隧道打开页面时会自动带上令牌，一般不用手填。若仍 401，清掉输入框后刷新，让页面重新注入当前 MONITOR_TOKEN。令牌也可保存在当前浏览器 localStorage 中。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="启动 立即结束 目标 cpa add_count 追加目标">
             <summary>点击启动后立即结束</summary>
@@ -2603,6 +2603,7 @@ HTML = r"""<!DOCTYPE html>
   <footer id="footer"></footer>
 </main>
 <script>
+/*MONITOR_TOKEN_BOOTSTRAP*/
 let last = null;
 let proxyData = null;
 let domainData = null;
@@ -2817,15 +2818,25 @@ function setMsg(id, text, cls) {
 function getToken() {
   const el = document.getElementById("monitor-token");
   const fromInput = el ? (el.value || "").trim() : "";
-  const tok = (fromInput || window.MONITOR_TOKEN || localStorage.getItem("MONITOR_TOKEN") || "").trim();
+  const injected = String(window.MONITOR_TOKEN || "").trim();
+  let stored = "";
+  try { stored = localStorage.getItem("MONITOR_TOKEN") || ""; } catch (e) {}
+  const tok = (fromInput || injected || stored || "").trim();
   if (fromInput) try { localStorage.setItem("MONITOR_TOKEN", fromInput); } catch (e) {}
+  else if (injected) try { localStorage.setItem("MONITOR_TOKEN", injected); } catch (e) {}
   return tok;
 }
 function loadTokenField() {
   const el = document.getElementById("monitor-token");
   if (!el) return;
-  if (!el.value) {
-    try { el.value = localStorage.getItem("MONITOR_TOKEN") || window.MONITOR_TOKEN || ""; } catch (e) {}
+  const injected = String(window.MONITOR_TOKEN || "").trim();
+  let stored = "";
+  try { stored = localStorage.getItem("MONITOR_TOKEN") || ""; } catch (e) {}
+  if (!el.value) el.value = injected || stored || "";
+  if (injected) {
+    el.placeholder = "本机已自动带上令牌";
+    const label = document.querySelector("label[for=monitor-token]");
+    if (label) label.textContent = "访问令牌（本机已自动带上）" ;
   }
 }
 async function api(path, opts) {
@@ -3958,6 +3969,30 @@ setInterval(() => {
 </html>
 """
 
+MONITOR_TOKEN_BOOTSTRAP = "/*MONITOR_TOKEN_BOOTSTRAP*/"
+
+
+def _is_loopback_addr(host: object) -> bool:
+    text = str(host or "").strip()
+    if text.lower().startswith("::ffff:"):
+        text = text.rsplit(":", 1)[-1]
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return text.lower() in {"localhost", "127.0.0.1", "::1"}
+
+
+def render_index_html(*, token: str = "", loopback: bool = False) -> str:
+    html = HTML
+    injected = str(token or "").strip()
+    if injected and loopback and MONITOR_TOKEN_BOOTSTRAP in html:
+        html = html.replace(
+            MONITOR_TOKEN_BOOTSTRAP,
+            "window.MONITOR_TOKEN = " + json.dumps(injected) + ";",
+            1,
+        )
+    return html
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "GrokRegister"
@@ -4049,7 +4084,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            self._send(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+            page = render_index_html(
+                token=expected_token(),
+                loopback=_is_loopback_addr(self.client_address[0] if self.client_address else ""),
+            )
+            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
             return
         if u.path in FONT_ASSETS:
             path = FONT_ASSETS[u.path]

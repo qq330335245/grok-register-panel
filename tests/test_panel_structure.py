@@ -265,6 +265,19 @@ def test_panel_security_and_recovery_structure():
     assert 'if u.path == "/favicon.ico":' in mon
     assert 'def version_string(self):' in mon
 
+
+def test_loopback_token_bootstrap_placeholder():
+    mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')
+    html = mon.split('HTML = r"""', 1)[1].split('"""', 1)[0]
+    assert '/*MONITOR_TOKEN_BOOTSTRAP*/' in html
+    assert 'def render_index_html' in mon
+    assert 'window.MONITOR_TOKEN' in html
+    boot = 'window.MONITOR_TOKEN = "loop-token";'
+    rendered = html.replace('/*MONITOR_TOKEN_BOOTSTRAP*/', boot, 1)
+    assert 'window.MONITOR_TOKEN = "loop-token";' in rendered
+    assert '/*MONITOR_TOKEN_BOOTSTRAP*/' not in rendered
+
+
 if __name__ == '__main__':
     test_workers_dom_ids_unique()
     test_no_cors_wildcard()
@@ -281,4 +294,5 @@ if __name__ == '__main__':
     test_proxy_pool_panel_structure()
     test_email_service_and_domain_rotation_panel_structure()
     test_panel_security_and_recovery_structure()
+    test_loopback_token_bootstrap_placeholder()
     print('OK structure')

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Auto-inject `MONITOR_TOKEN` into the live panel when the browser is on loopback (SSH tunnel / 127.0.0.1), so local testing does not require pasting the token.
 - Expand grok2api-style `{account}` / `{email}` / `{id}` sticky proxy templates per mailbox so one residential node can pin a unique exit to each registered account.
 - Add an `icloud` email provider that leases Apple Hide My Email aliases from a local inventory, receives xAI codes via the Cloudflare Temp-Mail admin inbox, and exposes inventory sync plus timed auto-create in the live panel.
 - Add an `inbucket` email provider for self-hosted Inbucket instances: generate addresses under a configured receive domain and poll the v1 mailbox API for the xAI verification code. Root domains accept a comma-separated rotation list, and `inbucket_random_levels` can stack 1-3 random subdomain labels per address (wildcard MX required).

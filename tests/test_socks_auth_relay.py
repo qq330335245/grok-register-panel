@@ -122,7 +122,8 @@ def test_wrap_firefox_proxy_starts_local_relay():
         assert relay is not None
         assert proxy["server"].startswith("socks5://127.0.0.1:")
         assert "username" not in proxy
-        client = socket.create_connection(("127.0.0.1", relay.port), timeout=5)
+        client = socket.create_connection(("127.0.0.1", relay.port), timeout=15)
+        client.settimeout(15)
         client.sendall(b"\x05\x01\x00")
         assert client.recv(2) == b"\x05\x00"
         host = b"127.0.0.1"

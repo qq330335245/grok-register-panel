@@ -12,6 +12,9 @@ cpa_auth/*
 !cpa_auth/.gitkeep
 grok2api_auth/*
 !grok2api_auth/.gitkeep
+grok2api_upload_pending.json
+grok2api_upload_pending_web.json
+grok2api_upload_pending_console.json
 log/*
 !log/.gitkeep
 .browser-profiles/

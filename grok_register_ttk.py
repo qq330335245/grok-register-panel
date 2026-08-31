@@ -32,6 +32,7 @@ import requests as _std_requests
 
 # SSO → CLIProxyAPI(CPA) 扁平格式转换（复用 sso_to_auth_json 的授权码流程 + 写入器）
 import sso_to_auth_json as _s2cpa
+import grok2api_client as _g2a_client
 from email_providers import cloudflare as cloudflare_provider
 from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
@@ -232,6 +233,16 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     # Grok2API / ~/.grok 风格 auth 目录（默认项目根目录下 grok2api_auth/）
     "grok2api_auth_dir": "grok2api_auth",
+    # grok2api 远程导入：注册换到 Build OAuth 后调用 admin import API
+    "grok2api_auto_upload": False,
+    "grok2api_upload_web": False,
+    "grok2api_upload_console": False,
+    "grok2api_base_url": "",
+    "grok2api_admin_user": "admin",
+    "grok2api_admin_password": "",
+    "grok2api_upload_retries": 3,
+    "grok2api_upload_retry_delay_s": 2.0,
+    "grok2api_upload_pending_file": "grok2api_upload_pending.json",
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -1229,6 +1240,121 @@ def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
     return state
 
 
+def _upload_grok2api_accounts(token, sso="", email="", log_callback=None) -> bool:
+    """Push the just-issued Build token / SSO into a remote grok2api admin API."""
+    need_build = bool(config.get("grok2api_auto_upload", False))
+    channels = []
+    if bool(config.get("grok2api_upload_web", False)):
+        channels.append("grok_web")
+    if bool(config.get("grok2api_upload_console", False)):
+        channels.append("grok_console")
+    if not need_build and not channels:
+        return True
+
+    def _g2a_log(message):
+        if log_callback:
+            log_callback(f"[grok2api] {str(message).strip()}")
+
+    base_url = str(config.get("grok2api_base_url", "") or "").strip()
+    admin_user = str(config.get("grok2api_admin_user", "") or "").strip()
+    admin_password = str(config.get("grok2api_admin_password", "") or "")
+    if not base_url or not admin_user or not admin_password:
+        _g2a_log("已开启远程上传但 grok2api_base_url/admin_user/admin_password 不完整，跳过")
+        return False
+    try:
+        retries = max(0, int(config.get("grok2api_upload_retries", 3) or 3))
+    except (TypeError, ValueError):
+        retries = 3
+    try:
+        delay = max(0.0, float(config.get("grok2api_upload_retry_delay_s", 2.0) or 2.0))
+    except (TypeError, ValueError):
+        delay = 2.0
+    pending_file = str(config.get("grok2api_upload_pending_file", "") or "").strip()
+    ok = True
+    if need_build:
+        entry = None
+        try:
+            entry = _g2a_client.token_to_grok2api_account(token or {}, email=email)
+            if not (
+                str(entry.get("access_token") or "").strip()
+                or str(entry.get("refresh_token") or "").strip()
+            ):
+                raise ValueError("Build 条目缺少 access_token/refresh_token")
+            _g2a_log(
+                f"upload Build email={entry.get('email') or email or '-'} "
+                f"-> {_g2a_client.normalize_base_url(base_url)}"
+            )
+            result = _g2a_client.upload_build_account(
+                base_url,
+                admin_user,
+                admin_password,
+                entry,
+                log=_g2a_log,
+                retries=retries,
+                retry_delay_s=delay,
+            )
+            _g2a_log(
+                f"Build upload OK created={result.get('created', 0)} "
+                f"updated={result.get('updated', 0)} synced={result.get('synced')} "
+                f"syncFailed={result.get('syncFailed')}"
+            )
+        except Exception as exc:
+            ok = False
+            _g2a_log(f"Build upload failed after retries: {exc}")
+            try:
+                pending_entry = entry or _g2a_client.token_to_grok2api_account(
+                    token or {}, email=email
+                )
+                saved = _g2a_client.save_upload_pending(
+                    pending_entry,
+                    pending_file or None,
+                    base_dir=APP_DIR,
+                    error=str(exc),
+                )
+                _g2a_log(f"Build 凭据已写入待导入文件 {saved}")
+            except Exception as save_exc:
+                _g2a_log(f"保存 Build 待导入失败: {save_exc}")
+    for provider in channels:
+        label = "Web" if provider == "grok_web" else "Console"
+        try:
+            _g2a_log(
+                f"upload {label} SSO email={email or '-'} "
+                f"-> {_g2a_client.normalize_base_url(base_url)}"
+            )
+            result = _g2a_client.upload_sso_account(
+                base_url,
+                admin_user,
+                admin_password,
+                provider=provider,
+                sso_token=sso,
+                email=email,
+                log=_g2a_log,
+                retries=retries,
+                retry_delay_s=delay,
+            )
+            _g2a_log(
+                f"{label} upload OK created={result.get('created', 0)} "
+                f"updated={result.get('updated', 0)}"
+            )
+        except Exception as exc:
+            ok = False
+            _g2a_log(f"{label} upload failed after retries: {exc}")
+            try:
+                saved = _g2a_client.save_sso_upload_pending(
+                    provider,
+                    sso,
+                    email,
+                    base_dir=APP_DIR,
+                    error=str(exc),
+                )
+                _g2a_log(f"{label} SSO 已写入待导入文件 {saved}")
+            except Exception as save_exc:
+                _g2a_log(f"保存 {label} 待导入失败: {save_exc}")
+    if need_build and len(channels) == 2 and ok:
+        _g2a_log("Web 与 Console 使用同一 SSO，grok2api 会建立绑定")
+    return ok
+
+
 def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
     """SSO → Device Flow（失败回退授权码）换 token → 写入 CPA / Grok2API。
 
@@ -1403,6 +1529,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                 wrote_ok = True
             except Exception as g2a_exc:
                 _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
+        _upload_grok2api_accounts(token, sso=sso, email=email, log_callback=log_callback)
         if not wrote_ok:
             _cpa_log("token 已换出但 CPA/Grok2API 均未写入成功")
             _append_sso_pending(email, sso, log_callback=log_callback)
@@ -3575,6 +3702,52 @@ class GrokRegisterGUI:
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 3, 3)
         c_label(4, 0, "Grok2API 目录:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_auth_dir_var, width=52), 4, 1, columnspan=3)
+        self.grok2api_auto_upload_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_auto_upload", False))
+        )
+        self.grok2api_upload_web_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_upload_web", False))
+        )
+        self.grok2api_upload_console_var = tk.BooleanVar(
+            value=bool(config.get("grok2api_upload_console", False))
+        )
+        self.grok2api_base_url_var = tk.StringVar(
+            value=str(config.get("grok2api_base_url", "") or "")
+        )
+        self.grok2api_admin_user_var = tk.StringVar(
+            value=str(config.get("grok2api_admin_user", "admin") or "admin")
+        )
+        self.grok2api_admin_password_var = tk.StringVar(
+            value=str(config.get("grok2api_admin_password", "") or "")
+        )
+        c_label(5, 0, "上传 Build:")
+        c_field(
+            tk_checkbutton(self.cpa_frame, variable=self.grok2api_auto_upload_var),
+            5, 1, sticky=tk.W,
+        )
+        c_label(5, 2, "上传 Web / Console:")
+        web_console = tk.Frame(self.cpa_frame, bg=UI_PANEL_BG)
+        tk_checkbutton(web_console, text="Web", variable=self.grok2api_upload_web_var).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
+        tk_checkbutton(web_console, text="Console", variable=self.grok2api_upload_console_var).pack(
+            side=tk.LEFT
+        )
+        c_field(web_console, 5, 3, sticky=tk.W)
+        c_label(6, 0, "grok2api 地址:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_base_url_var, width=34), 6, 1)
+        c_label(6, 2, "管理员用户:")
+        c_field(tk_entry(self.cpa_frame, textvariable=self.grok2api_admin_user_var, width=28), 6, 3)
+        c_label(7, 0, "管理员密码:")
+        c_field(
+            tk_entry(
+                self.cpa_frame,
+                textvariable=self.grok2api_admin_password_var,
+                width=52,
+                show="*",
+            ),
+            7, 1, columnspan=3,
+        )
 
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
@@ -3791,6 +3964,12 @@ class GrokRegisterGUI:
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
             config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
+            config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
+            config["grok2api_upload_web"] = bool(self.grok2api_upload_web_var.get())
+            config["grok2api_upload_console"] = bool(self.grok2api_upload_console_var.get())
+            config["grok2api_base_url"] = self.grok2api_base_url_var.get().strip()
+            config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip() or "admin"
+            config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
         except Exception:
             pass
         self.log("[*] 开始连通性检查...")
@@ -3920,6 +4099,12 @@ class GrokRegisterGUI:
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
         config["grok2api_auth_dir"] = self.grok2api_auth_dir_var.get().strip()
+        config["grok2api_auto_upload"] = bool(self.grok2api_auto_upload_var.get())
+        config["grok2api_upload_web"] = bool(self.grok2api_upload_web_var.get())
+        config["grok2api_upload_console"] = bool(self.grok2api_upload_console_var.get())
+        config["grok2api_base_url"] = self.grok2api_base_url_var.get().strip()
+        config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip() or "admin"
+        config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])

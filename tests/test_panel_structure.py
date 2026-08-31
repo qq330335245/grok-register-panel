@@ -8,6 +8,9 @@ def test_workers_dom_ids_unique():
     assert 'id="workers-input"' in mon
     assert 'id="workers-stats"' in mon
     assert not re.search(r'id="workers"', mon)
+    assert 'id="delivery-view-toggle"' in mon
+    assert 'id="delivery-g2a-url"' in mon
+    assert '/api/delivery' in mon
 
 def test_no_cors_wildcard():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')

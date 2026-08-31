@@ -54,6 +54,11 @@ try:
         save_email_provider_config,
         test_email_provider_config,
     )
+    from webui.delivery_store import (
+        read_delivery_config,
+        save_delivery_config,
+        test_delivery_config,
+    )
     from webui.icloud_ops import (
         inventory_snapshot as icloud_inventory_snapshot,
         notify_config_updated as notify_icloud_config_updated,
@@ -105,6 +110,11 @@ except ImportError:  # running as script from webui/
         read_email_provider_config,
         save_email_provider_config,
         test_email_provider_config,
+    )
+    from delivery_store import (  # type: ignore
+        read_delivery_config,
+        save_delivery_config,
+        test_delivery_config,
     )
     from icloud_ops import (  # type: ignore
         inventory_snapshot as icloud_inventory_snapshot,
@@ -1539,6 +1549,38 @@ HTML = r"""<!DOCTYPE html>
   .sso-verdict.error, .sso-verdict.unknown { border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); color: var(--warn); }
   body.domain-view-open { overflow: hidden; }
   body.domain-view-open #dashboard-view > :not(#domain-view) { display: none; }
+  body.delivery-view-open { overflow: hidden; }
+  body.delivery-view-open #dashboard-view > :not(#delivery-view) { display: none; }
+  .delivery-view {
+    position: fixed;
+    inset: 68px 0 0;
+    z-index: 8;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background-color: var(--bg);
+    background-image:
+      linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .delivery-view[hidden] { display: none; }
+  .delivery-view-inner {
+    width: min(calc(100% - 64px), 1280px);
+    margin: 0 auto;
+    padding: 28px 0 48px;
+  }
+  .delivery-view-heading {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .delivery-view-subtitle { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
+  .delivery-checks { display: flex; flex-wrap: wrap; gap: 12px 18px; padding: 4px 0 8px; }
+  .delivery-checks label { display: flex; align-items: center; gap: 8px; font-size: 13px; }
   .domain-view {
     position: fixed;
     inset: 68px 0 0;
@@ -1912,6 +1954,9 @@ HTML = r"""<!DOCTYPE html>
     .domain-view { inset-block-start: 60px; }
     .domain-view-inner { width: calc(100% - 24px); padding: 20px 0 34px; }
     .domain-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
+    .delivery-view { inset-block-start: 60px; }
+    .delivery-view-inner { width: calc(100% - 24px); padding: 20px 0 34px; }
+    .delivery-view-heading { align-items: flex-start; flex-direction: column; margin-bottom: 16px; padding-bottom: 16px; }
     .mail-provider-panel { padding: 14px; }
     .mail-provider-toolbar { grid-template-columns: minmax(0, 1fr); gap: 10px; }
     .mail-provider-toolbar .field { max-width: none; }
@@ -1945,14 +1990,16 @@ HTML = r"""<!DOCTYPE html>
     .button-group { justify-content: flex-start; }
     #run-status { display: none; }
     button.view-switch { min-width: 0; padding-inline: 6px; }
-    #domain-view-label, #proxy-view-label, #sso-view-label, #help-view-label { font-size: 0; }
+    #domain-view-label, #proxy-view-label, #sso-view-label, #help-view-label, #delivery-view-label { font-size: 0; }
     #domain-view-label::after { content: "邮箱"; font-size: 11px; }
     #proxy-view-label::after { content: "代理"; font-size: 11px; }
     #sso-view-label::after { content: "风控"; font-size: 11px; }
+    #delivery-view-label::after { content: "入库"; font-size: 11px; }
     #help-view-label::after { content: "问题"; font-size: 11px; }
     #domain-view-toggle[data-active="true"] #domain-view-label::after,
     #proxy-view-toggle[data-active="true"] #proxy-view-label::after,
     #sso-view-toggle[data-active="true"] #sso-view-label::after,
+    #delivery-view-toggle[data-active="true"] #delivery-view-label::after,
     #help-view-toggle[data-active="true"] #help-view-label::after { content: "返回"; }
     button.theme-option { padding-inline: 6px; }
     .domain-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2025,6 +2072,9 @@ HTML = r"""<!DOCTYPE html>
       <button type="button" class="view-switch" id="sso-view-toggle" aria-label="打开 SSO 风控" title="SSO 风控" aria-controls="sso-view" aria-expanded="false" data-active="false" onclick="toggleSsoView()">
         <span id="sso-view-label" aria-hidden="true">SSO 风控</span>
       </button>
+      <button type="button" class="view-switch" id="delivery-view-toggle" aria-label="打开入库配置" title="入库配置" aria-controls="delivery-view" aria-expanded="false" data-active="false" onclick="toggleDeliveryView()">
+        <span id="delivery-view-label" aria-hidden="true">入库配置</span>
+      </button>
       <button type="button" class="view-switch" id="help-view-toggle" aria-label="打开问题和使用" title="问题和使用" aria-controls="help-view" aria-expanded="false" data-active="false" onclick="toggleAppView()">
         <span id="help-view-label" aria-hidden="true">问题和使用</span>
       </button>
@@ -2053,7 +2103,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="control-grid">
       <div class="field field-token">
         <label for="monitor-token">访问令牌</label>
-        <input id="monitor-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshBfs()" onblur="getToken()"/>
+        <input id="monitor-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshBfs(); refreshDeliveryConfig()" onblur="getToken()"/>
       </div>
       <div class="field field-mode">
         <label for="mode">运行模式</label>
@@ -2376,6 +2426,64 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 
+  <section class="delivery-view" id="delivery-view" aria-labelledby="delivery-view-title" hidden>
+    <div class="delivery-view-inner">
+      <div class="delivery-view-heading">
+        <div>
+          <div class="mail-source-kicker">Account delivery</div>
+          <div class="page-title" id="delivery-view-title">入库配置</div>
+          <p class="delivery-view-subtitle" id="delivery-subtitle">注册成功后写入 CPA / grok2api 的目标与开关</p>
+        </div>
+        <span class="badge" id="delivery-ready-badge">未就绪</span>
+      </div>
+      <section class="mail-provider-panel" aria-labelledby="delivery-view-title">
+        <div class="delivery-checks">
+          <label><input type="checkbox" id="delivery-cpa-auto"/> SSO→token 并写入 CPA / 本地 grok2api 文件</label>
+          <label><input type="checkbox" id="delivery-g2a-build"/> 远程上传 Build</label>
+          <label><input type="checkbox" id="delivery-g2a-web"/> 远程上传 Web</label>
+          <label><input type="checkbox" id="delivery-g2a-console"/> 远程上传 Console</label>
+        </div>
+        <div class="mail-provider-fields">
+          <div class="field"><label for="delivery-token-mode">Token 换取</label>
+            <select id="delivery-token-mode">
+              <option value="device_protocol">协议 Device Flow</option>
+              <option value="device_browser">浏览器 Device Flow</option>
+              <option value="auth_code">Authorization Code</option>
+            </select>
+          </div>
+          <div class="field"><label for="delivery-cpa-dir">CPA 目录</label><input id="delivery-cpa-dir" type="text" autocomplete="off" spellcheck="false"/></div>
+          <div class="field"><label for="delivery-g2a-dir">Grok2API 目录</label><input id="delivery-g2a-dir" type="text" autocomplete="off" spellcheck="false"/></div>
+          <div class="field"><label for="delivery-cpa-url">CPA 远程地址</label><input id="delivery-cpa-url" type="url" placeholder="https://cpa.example" autocomplete="off" spellcheck="false"/></div>
+          <div class="field"><label for="delivery-cpa-key">CPA 管理密钥</label>
+            <div class="mail-secret-wrap" data-delivery-secret-wrap="cpa_management_key">
+              <input id="delivery-cpa-key" type="password" autocomplete="new-password" placeholder="已配置则留空保留" oninput="deliverySecretInput('cpa_management_key')"/>
+              <button type="button" id="delivery-cpa-key-clear" hidden data-delivery-secret-button="cpa_management_key" onclick="toggleDeliverySecret('cpa_management_key')">清除</button>
+            </div>
+            <div class="mail-secret-note" data-delivery-secret-note="cpa_management_key">尚未配置</div>
+          </div>
+          <div class="field"><label for="delivery-g2a-url">grok2api 地址</label><input id="delivery-g2a-url" type="url" placeholder="https://g2a.example" autocomplete="off" spellcheck="false"/></div>
+          <div class="field"><label for="delivery-g2a-user">管理员用户</label><input id="delivery-g2a-user" type="text" autocomplete="off" spellcheck="false"/></div>
+          <div class="field"><label for="delivery-g2a-pass">管理员密码</label>
+            <div class="mail-secret-wrap" data-delivery-secret-wrap="grok2api_admin_password">
+              <input id="delivery-g2a-pass" type="password" autocomplete="new-password" placeholder="已配置则留空保留" oninput="deliverySecretInput('grok2api_admin_password')"/>
+              <button type="button" id="delivery-g2a-pass-clear" hidden data-delivery-secret-button="grok2api_admin_password" onclick="toggleDeliverySecret('grok2api_admin_password')">清除</button>
+            </div>
+            <div class="mail-secret-note" data-delivery-secret-note="grok2api_admin_password">尚未配置</div>
+          </div>
+          <div class="field"><label for="delivery-retries">上传重试次数</label><input id="delivery-retries" type="number" min="0" max="10"/></div>
+          <div class="field"><label for="delivery-retry-delay">重试间隔（秒）</label><input id="delivery-retry-delay" type="number" min="0" max="30" step="0.5"/></div>
+          <div class="field wide"><label for="delivery-pending">失败待导入文件</label><input id="delivery-pending" type="text" autocomplete="off" spellcheck="false"/></div>
+        </div>
+        <div class="mail-provider-actions">
+          <button class="primary" id="delivery-save" onclick="saveDeliveryConfig()">保存配置</button>
+          <button id="delivery-test" onclick="testDeliveryConfig()">测试 grok2api 登录</button>
+          <span class="mail-provider-meta mono" id="delivery-updated">尚未读取</span>
+        </div>
+        <div class="msg mail-provider-result" id="delivery-msg" role="status" aria-live="polite"></div>
+      </section>
+    </div>
+  </section>
+
   <section class="sso-view" id="sso-view" aria-labelledby="sso-view-title" hidden>
     <div class="sso-view-inner">
       <div class="sso-view-heading">
@@ -2612,6 +2720,8 @@ let domainData = null;
 let emailProviderData = null;
 let selectedEmailProvider = "";
 const clearedEmailSecrets = new Set();
+let deliveryData = null;
+const clearedDeliverySecrets = new Set();
 const THEME_KEY = "GROK_REGISTER_THEME";
 const APP_VIEW_KEY = "GROK_REGISTER_APP_VIEW";
 const HELP_TAB_KEY = "GROK_REGISTER_HELP_TAB";
@@ -2640,12 +2750,13 @@ function setTheme(theme) {
   syncThemeButtons();
 }
 function setAppView(view, options = {}) {
-  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "sso") return;
+  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "sso" && view !== "delivery") return;
   const dashboard = document.getElementById("dashboard-view");
   const help = document.getElementById("help-view");
   const proxies = document.getElementById("proxy-view");
   const domains = document.getElementById("domain-view");
   const sso = document.getElementById("sso-view");
+  const delivery = document.getElementById("delivery-view");
   const domainToggle = document.getElementById("domain-view-toggle");
   const domainLabel = document.getElementById("domain-view-label");
   const toggle = document.getElementById("help-view-toggle");
@@ -2654,13 +2765,16 @@ function setAppView(view, options = {}) {
   const proxyLabel = document.getElementById("proxy-view-label");
   const ssoToggle = document.getElementById("sso-view-toggle");
   const ssoLabel = document.getElementById("sso-view-label");
-  if (!dashboard || !help || !proxies || !domains || !sso || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ssoToggle || !ssoLabel) return;
+  const deliveryToggle = document.getElementById("delivery-view-toggle");
+  const deliveryLabel = document.getElementById("delivery-view-label");
+  if (!dashboard || !help || !proxies || !domains || !sso || !delivery || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ssoToggle || !ssoLabel || !deliveryToggle || !deliveryLabel) return;
   const isHelp = view === "help";
   const isProxies = view === "proxies";
   const isDomains = view === "domains";
   const isSso = view === "sso";
-  const isOverlay = isHelp || isProxies || isDomains || isSso;
-  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== sso);
+  const isDelivery = view === "delivery";
+  const isOverlay = isHelp || isProxies || isDomains || isSso || isDelivery;
+  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== sso && element !== delivery);
   dashboardChildren.forEach(element => {
     element.inert = isOverlay;
     if (isOverlay) element.setAttribute("aria-hidden", "true");
@@ -2674,10 +2788,13 @@ function setAppView(view, options = {}) {
   domains.inert = !isDomains;
   sso.hidden = !isSso;
   sso.inert = !isSso;
+  delivery.hidden = !isDelivery;
+  delivery.inert = !isDelivery;
   document.body.classList.toggle("help-view-open", isHelp);
   document.body.classList.toggle("proxy-view-open", isProxies);
   document.body.classList.toggle("domain-view-open", isDomains);
   document.body.classList.toggle("sso-view-open", isSso);
+  document.body.classList.toggle("delivery-view-open", isDelivery);
   toggle.dataset.active = String(isHelp);
   toggle.setAttribute("aria-expanded", String(isHelp));
   toggle.setAttribute("aria-label", isHelp ? "返回控制台" : "打开问题和使用");
@@ -2698,6 +2815,11 @@ function setAppView(view, options = {}) {
   ssoToggle.setAttribute("aria-label", isSso ? "返回控制台" : "打开 SSO 风控");
   ssoToggle.title = isSso ? "返回控制台" : "SSO 风控";
   ssoLabel.textContent = isSso ? "返回控制台" : "SSO 风控";
+  deliveryToggle.dataset.active = String(isDelivery);
+  deliveryToggle.setAttribute("aria-expanded", String(isDelivery));
+  deliveryToggle.setAttribute("aria-label", isDelivery ? "返回控制台" : "打开入库配置");
+  deliveryToggle.title = isDelivery ? "返回控制台" : "入库配置";
+  deliveryLabel.textContent = isDelivery ? "返回控制台" : "入库配置";
   if (options.persist !== false) {
     try { localStorage.setItem(APP_VIEW_KEY, view); } catch (e) {}
   }
@@ -2707,11 +2829,12 @@ function setAppView(view, options = {}) {
     refreshEmailDomains();
   }
   if (isSso) refreshSsoState();
+  if (isDelivery) refreshDeliveryConfig();
   if (options.focus) {
     requestAnimationFrame(() => {
       const target = isHelp
         ? document.querySelector('[data-help-tab][aria-selected="true"]')
-        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isSso ? document.getElementById("sso-input") : (view === "dashboard" ? domainToggle : toggle))));
+        : (isProxies ? document.getElementById("proxy-input") : (isDomains ? document.getElementById("mail-provider-select") : (isSso ? document.getElementById("sso-input") : (isDelivery ? document.getElementById("delivery-g2a-url") : (view === "dashboard" ? domainToggle : toggle)))));
       if (target) target.focus();
     });
   }
@@ -2731,6 +2854,10 @@ function toggleDomainView() {
 function toggleSsoView() {
   const isSso = document.body.classList.contains("sso-view-open");
   setAppView(isSso ? "dashboard" : "sso", { focus: true });
+}
+function toggleDeliveryView() {
+  const isDelivery = document.body.classList.contains("delivery-view-open");
+  setAppView(isDelivery ? "dashboard" : "delivery", { focus: true });
 }
 function setHelpTab(name) {
   if (name !== "guide" && name !== "faq") return;
@@ -3183,6 +3310,126 @@ async function testEmailProviderConnection() {
     }) });
     setMsg("mail-provider-msg", result.detail || "连接正常", "ok");
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+function deliverySecretInput(name) {
+  const input = name === "cpa_management_key" ? document.getElementById("delivery-cpa-key") : document.getElementById("delivery-g2a-pass");
+  if (input && input.value && clearedDeliverySecrets.has(name)) toggleDeliverySecret(name);
+}
+function toggleDeliverySecret(name) {
+  const clearing = !clearedDeliverySecrets.has(name);
+  if (clearing) clearedDeliverySecrets.add(name);
+  else clearedDeliverySecrets.delete(name);
+  const wrap = document.querySelector(`[data-delivery-secret-wrap="${name}"]`);
+  const button = document.querySelector(`[data-delivery-secret-button="${name}"]`);
+  const note = document.querySelector(`[data-delivery-secret-note="${name}"]`);
+  if (wrap) wrap.classList.toggle("pending-clear", clearing);
+  if (button) button.textContent = clearing ? "撤销" : "清除";
+  if (note) {
+    note.textContent = clearing ? "保存后清除密钥" : "已保存密钥";
+    note.className = "mail-secret-note" + (clearing ? " warn" : "");
+  }
+}
+function renderDeliverySecret(name, configured) {
+  const button = document.querySelector(`[data-delivery-secret-button="${name}"]`);
+  const note = document.querySelector(`[data-delivery-secret-note="${name}"]`);
+  const wrap = document.querySelector(`[data-delivery-secret-wrap="${name}"]`);
+  if (wrap) wrap.classList.remove("pending-clear");
+  if (button) {
+    button.hidden = !configured;
+    button.textContent = "清除";
+  }
+  if (note) {
+    note.textContent = configured ? "已保存密钥" : "尚未配置";
+    note.className = "mail-secret-note";
+  }
+}
+function renderDeliveryConfig(data) {
+  deliveryData = data || {};
+  const values = deliveryData.values || {};
+  const secrets = deliveryData.secret_configured || {};
+  clearedDeliverySecrets.clear();
+  document.getElementById("delivery-cpa-auto").checked = !!values.cpa_auto_add;
+  document.getElementById("delivery-g2a-build").checked = !!values.grok2api_auto_upload;
+  document.getElementById("delivery-g2a-web").checked = !!values.grok2api_upload_web;
+  document.getElementById("delivery-g2a-console").checked = !!values.grok2api_upload_console;
+  document.getElementById("delivery-token-mode").value = values.cpa_token_mode || "device_protocol";
+  document.getElementById("delivery-cpa-dir").value = values.cpa_auth_dir || "";
+  document.getElementById("delivery-g2a-dir").value = values.grok2api_auth_dir || "";
+  document.getElementById("delivery-cpa-url").value = values.cpa_remote_url || "";
+  document.getElementById("delivery-cpa-key").value = "";
+  document.getElementById("delivery-g2a-url").value = values.grok2api_base_url || "";
+  document.getElementById("delivery-g2a-user").value = values.grok2api_admin_user || "admin";
+  document.getElementById("delivery-g2a-pass").value = "";
+  document.getElementById("delivery-retries").value = values.grok2api_upload_retries ?? 3;
+  document.getElementById("delivery-retry-delay").value = values.grok2api_upload_retry_delay_s ?? 2;
+  document.getElementById("delivery-pending").value = values.grok2api_upload_pending_file || "";
+  renderDeliverySecret("cpa_management_key", !!secrets.cpa_management_key);
+  renderDeliverySecret("grok2api_admin_password", !!secrets.grok2api_admin_password);
+  const badge = document.getElementById("delivery-ready-badge");
+  badge.textContent = deliveryData.upload_ready ? "可上传" : "未就绪";
+  badge.className = "badge " + (deliveryData.upload_ready ? "ok" : "warn");
+  const updated = deliveryData.mtime ? new Date(deliveryData.mtime * 1000) : null;
+  document.getElementById("delivery-updated").textContent = updated && !Number.isNaN(updated.getTime())
+    ? ("config.json " + updated.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }))
+    : "config.json 尚未创建";
+  document.getElementById("delivery-subtitle").textContent = values.grok2api_base_url
+    ? ("当前 grok2api：" + values.grok2api_base_url)
+    : "注册成功后写入 CPA / grok2api 的目标与开关";
+}
+function collectDeliverySettings() {
+  return {
+    cpa_auto_add: document.getElementById("delivery-cpa-auto").checked,
+    grok2api_auto_upload: document.getElementById("delivery-g2a-build").checked,
+    grok2api_upload_web: document.getElementById("delivery-g2a-web").checked,
+    grok2api_upload_console: document.getElementById("delivery-g2a-console").checked,
+    cpa_token_mode: document.getElementById("delivery-token-mode").value,
+    cpa_auth_dir: document.getElementById("delivery-cpa-dir").value,
+    grok2api_auth_dir: document.getElementById("delivery-g2a-dir").value,
+    cpa_remote_url: document.getElementById("delivery-cpa-url").value,
+    cpa_management_key: document.getElementById("delivery-cpa-key").value,
+    grok2api_base_url: document.getElementById("delivery-g2a-url").value,
+    grok2api_admin_user: document.getElementById("delivery-g2a-user").value,
+    grok2api_admin_password: document.getElementById("delivery-g2a-pass").value,
+    grok2api_upload_retries: Number(document.getElementById("delivery-retries").value),
+    grok2api_upload_retry_delay_s: Number(document.getElementById("delivery-retry-delay").value),
+    grok2api_upload_pending_file: document.getElementById("delivery-pending").value,
+  };
+}
+async function refreshDeliveryConfig(authHelp = false) {
+  try {
+    const data = await api("/api/delivery?_=" + Date.now(), { authHelp });
+    renderDeliveryConfig(data);
+    if (!data.ok && data.error) setMsg("delivery-msg", data.error, "err");
+  } catch (e) {
+    setMsg("delivery-msg", String(e.message || e), "err");
+  }
+}
+async function saveDeliveryConfig() {
+  const button = document.getElementById("delivery-save");
+  button.disabled = true;
+  setMsg("delivery-msg", "正在保存…", "");
+  try {
+    const result = await api("/api/delivery", { method: "POST", body: JSON.stringify({
+      settings: collectDeliverySettings(),
+      clear_secrets: Array.from(clearedDeliverySecrets),
+    }) });
+    renderDeliveryConfig(result);
+    setMsg("delivery-msg", "入库配置已保存", "ok");
+  } catch (e) { setMsg("delivery-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+async function testDeliveryConfig() {
+  const button = document.getElementById("delivery-test");
+  button.disabled = true;
+  setMsg("delivery-msg", "正在测试 grok2api 登录…", "");
+  try {
+    const result = await api("/api/delivery/test", { method: "POST", body: JSON.stringify({
+      settings: collectDeliverySettings(),
+      clear_secrets: Array.from(clearedDeliverySecrets),
+    }) });
+    setMsg("delivery-msg", result.detail || "登录成功", "ok");
+  } catch (e) { setMsg("delivery-msg", String(e.message || e), "err"); }
   button.disabled = false;
 }
 function formatIcloudTime(value) {
@@ -4134,7 +4381,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/icloud-auto-create", "/api/icloud-inventory"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/icloud-auto-create", "/api/icloud-inventory", "/api/delivery"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4187,6 +4434,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/email-provider":
             try:
                 self._json(200, read_email_provider_config())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/delivery":
+            try:
+                self._json(200, read_delivery_config())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4329,6 +4582,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(code, result)
             except Exception as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/delivery":
+            try:
+                result = save_delivery_config(
+                    body.get("settings") or {},
+                    clear_secrets=body.get("clear_secrets"),
+                )
+                self._json(200, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/delivery/test":
+            try:
+                result = test_delivery_config(
+                    body.get("settings") or {},
+                    clear_secrets=body.get("clear_secrets"),
+                )
+                self._json(200 if result.get("ok") else 424, result)
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/email-provider":
             try:

@@ -170,7 +170,7 @@ Windows 不要把 `PLAYWRIGHT_NODEJS_PATH` 指到 `scripts/playwright-node`（�
 | `cpa_remote_url` / `cpa_management_key` | 远程 CPA Management API（可选） |
 | `grok2api_auto_upload` | 注册成功后把 Build OAuth 导入远程 grok2api admin API |
 | `grok2api_upload_web` / `grok2api_upload_console` | 用同一 SSO 再导入 Web / Console（服务端会绑定） |
-| `grok2api_base_url` / `grok2api_admin_user` / `grok2api_admin_password` | grok2api 管理端地址与管理员账号 |
+| `grok2api_base_url` / `grok2api_admin_user` / `grok2api_admin_password` | grok2api 管理端地址与管理员账号。也可在面板顶栏 **入库配置** 里改 |
 | `grok2api_upload_pending_file` | 远程导入失败时落盘的待导入 JSON |
 
 ### 环境变量

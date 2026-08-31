@@ -13,6 +13,7 @@
 ### Fixed
 
 - Relay authenticated SOCKS5 through a local no-auth listener before Camoufox/Firefox. Playwright Firefox rejects SOCKS5 username/password (`Browser does not support socks5 proxy authentication`); the previous `socks5h://user:pass@…` launch path did not actually authenticate and reset `accounts.x.ai`.
+- Add a live-panel **入库配置** view to edit CPA/grok2api delivery targets, admin credentials, and upload switches without hand-editing `config.json`.
 - Port grokRegister-cpa remote grok2api admin import: after SSO→Build OAuth, optionally POST `/api/admin/v1/accounts/import` (and Web/Console SSO imports) with retries and a pending JSON fallback.
 - Disable Firefox HTTP/3 through SOCKS and retry `accounts.x.ai` navigation on `NS_ERROR_NET_RESET`, which IPv6 sticky exits commonly hit on Cloudflare.
 - After IPv4 SOCKS host-unreachable (code 4 / curl 97) on sticky residential exits, retry IPv6 IP probes (`v6.ipinfo.io`, Cloudflare IPv6 trace) instead of failing browser start.

@@ -36,9 +36,26 @@ class ICloudAutoCreateScheduler:
         self,
         config_getter: Callable[[], Dict[str, Any]],
         create_batch: Callable[[int, Callable[[str], None]], Dict[str, Any]],
+        *,
+        enabled_key: str = "icloud_auto_create_enabled",
+        interval_key: str = "icloud_auto_create_interval_minutes",
+        batch_key: str = "icloud_auto_create_batch_size",
+        default_interval: int = 60,
+        default_batch: int = 1,
+        max_batch: int = MAX_BATCH_SIZE,
+        verb: str = "创建",
+        thread_name: str = "icloud-auto-create",
     ):
         self._config_getter = config_getter
         self._create_batch = create_batch
+        self._enabled_key = enabled_key
+        self._interval_key = interval_key
+        self._batch_key = batch_key
+        self._default_interval = default_interval
+        self._default_batch = default_batch
+        self._max_batch = max_batch
+        self._verb = verb
+        self._thread_name = thread_name
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -58,18 +75,18 @@ class ICloudAutoCreateScheduler:
     def _schedule(self) -> Dict[str, Any]:
         config = self._config_getter() or {}
         return {
-            "enabled": bool(config.get("icloud_auto_create_enabled", False)),
+            "enabled": bool(config.get(self._enabled_key, False)),
             "interval_minutes": _as_int(
-                config.get("icloud_auto_create_interval_minutes", 60),
+                config.get(self._interval_key, self._default_interval),
                 MIN_INTERVAL_MINUTES,
                 MAX_INTERVAL_MINUTES,
-                60,
+                self._default_interval,
             ),
             "batch_size": _as_int(
-                config.get("icloud_auto_create_batch_size", 1),
+                config.get(self._batch_key, self._default_batch),
                 MIN_BATCH_SIZE,
-                MAX_BATCH_SIZE,
-                1,
+                self._max_batch,
+                self._default_batch,
             ),
         }
 
@@ -115,7 +132,7 @@ class ICloudAutoCreateScheduler:
             self._thread = threading.Thread(
                 target=self._run_loop,
                 daemon=True,
-                name="icloud-auto-create",
+                name=self._thread_name,
             )
             self._thread.start()
         self.notify_schedule_updated()
@@ -134,12 +151,12 @@ class ICloudAutoCreateScheduler:
             if not schedule["enabled"] and not self._running:
                 self._next_run_at = None
                 self._run_now_requested = False
-                self._append_log_locked("info", "iCloud 定时创建已禁用")
+                self._append_log_locked("info", f"iCloud 定时{self._verb}已禁用")
             elif schedule["enabled"] and not self._running:
                 self._next_run_at = now + timedelta(minutes=schedule["interval_minutes"])
                 self._append_log_locked(
                     "info",
-                    f"iCloud 定时创建已启用：每 {schedule['interval_minutes']} 分钟创建 {schedule['batch_size']} 个",
+                    f"iCloud 定时{self._verb}已启用：每 {schedule['interval_minutes']} 分钟{self._verb} {schedule['batch_size']} 个",
                 )
         return self.snapshot()
 
@@ -148,7 +165,7 @@ class ICloudAutoCreateScheduler:
             self._run_now_requested = True
             if not self._running:
                 self._next_run_at = _utc_now()
-            self._append_log_locked("info", "已请求立即创建 iCloud 邮箱")
+            self._append_log_locked("info", f"已请求立即{self._verb} iCloud 邮箱")
         return self.snapshot()
 
     def _run_loop(self) -> None:
@@ -178,7 +195,7 @@ class ICloudAutoCreateScheduler:
             self._last_result = {}
             self._last_started_at = now
             self._last_finished_at = None
-            self._append_log_locked("info", f"开始 iCloud 定时创建（{reason}）")
+            self._append_log_locked("info", f"开始 iCloud 定时{self._verb}（{reason}）")
         threading.Thread(
             target=self._execute,
             args=(schedule["batch_size"], reason),
@@ -192,7 +209,7 @@ class ICloudAutoCreateScheduler:
                 batch_size,
                 lambda message: self._log_from_batch(message),
             )
-            created = int(result.get("created_count") or 0)
+            created = int(result.get("created_count") or result.get("deleted_count") or 0)
             failed = int(result.get("failed_count") or 0)
             status = "success" if failed == 0 else ("partial" if created else "failed")
             error = "; ".join(str(item) for item in (result.get("errors") or [])[:3])
@@ -220,11 +237,11 @@ class ICloudAutoCreateScheduler:
                 )
             self._today_total += created
             if status == "success":
-                self._append_log_locked("success", f"本次创建完成：新建 {created} 个")
+                self._append_log_locked("success", f"本次{self._verb}完成：处理 {created} 个")
             elif status == "partial":
-                self._append_log_locked("warning", f"本次部分成功：新建 {created} 个，失败 {failed} 个")
+                self._append_log_locked("warning", f"本次部分成功：处理 {created} 个，失败 {failed} 个")
             else:
-                self._append_log_locked("error", f"本次创建失败：{error or 'unknown_error'}")
+                self._append_log_locked("error", f"本次{self._verb}失败：{error or 'unknown_error'}")
 
     def _log_from_batch(self, message: str) -> None:
         with self._lock:

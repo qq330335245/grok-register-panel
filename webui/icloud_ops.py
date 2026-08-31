@@ -44,8 +44,6 @@ def _inventory_service(config: Optional[Dict[str, Any]] = None):
         raise RuntimeError("iCloud 库存模块不可用")
     config = config or _raw_config()
     cookies = str(config.get("icloud_cookies") or "").strip()
-    if not cookies:
-        raise ValueError("请先配置 iCloud Cookies")
     return alias_pool.get_lease_service(
         cookies,
         inventory_path=str(
@@ -68,28 +66,88 @@ def _inventory_service(config: Optional[Dict[str, Any]] = None):
     )
 
 
+def _account_ids(config: Dict[str, Any], key: str) -> list:
+    raw = config.get(key)
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
 def _create_batch(count: int, log_callback) -> Dict[str, Any]:
     service = _inventory_service()
-    return service.create_free_aliases(count, log_callback=log_callback)
+    config = _raw_config()
+    return service.create_free_aliases(
+        count,
+        log_callback=log_callback,
+        account_ids=_account_ids(config, "icloud_auto_create_account_ids"),
+    )
+
+
+def _delete_batch(count: int, log_callback) -> Dict[str, Any]:
+    service = _inventory_service()
+    config = _raw_config()
+    return service.delete_registered_aliases(
+        count,
+        min_age_hours=_as_float(config.get("icloud_auto_delete_min_age_hours"), 0),
+        keep_last=_as_int(config.get("icloud_auto_delete_keep_last"), 0),
+        account_ids=_account_ids(config, "icloud_auto_delete_account_ids"),
+        log_callback=log_callback,
+    )
 
 
 SCHEDULER = ICloudAutoCreateScheduler(_raw_config, _create_batch)
+DELETE_SCHEDULER = ICloudAutoCreateScheduler(
+    _raw_config,
+    _delete_batch,
+    enabled_key="icloud_auto_delete_enabled",
+    interval_key="icloud_auto_delete_interval_minutes",
+    batch_key="icloud_auto_delete_batch_size",
+    default_interval=120,
+    default_batch=5,
+    max_batch=50,
+    verb="删除",
+    thread_name="icloud-auto-delete",
+)
 
 
 def start_scheduler() -> None:
     SCHEDULER.start()
+    DELETE_SCHEDULER.start()
 
 
 def notify_config_updated() -> Dict[str, Any]:
-    return SCHEDULER.notify_schedule_updated()
+    config = _raw_config()
+    cookies = str(config.get("icloud_cookies") or "").strip()
+    if cookies:
+        try:
+            _inventory_service().add_account(cookies, name="default")
+        except Exception:
+            pass
+    return {
+        "create": SCHEDULER.notify_schedule_updated(),
+        "delete": DELETE_SCHEDULER.notify_schedule_updated(),
+    }
 
 
 def runtime_snapshot() -> Dict[str, Any]:
-    return {"ok": True, "runtime": SCHEDULER.snapshot()}
+    config = _raw_config()
+    return {
+        "ok": True,
+        "runtime": SCHEDULER.snapshot(),
+        "delete_runtime": DELETE_SCHEDULER.snapshot(),
+        "create_account_ids": _account_ids(config, "icloud_auto_create_account_ids"),
+        "delete_account_ids": _account_ids(config, "icloud_auto_delete_account_ids"),
+        "delete_min_age_hours": _as_float(config.get("icloud_auto_delete_min_age_hours"), 0),
+        "delete_keep_last": _as_int(config.get("icloud_auto_delete_keep_last"), 0),
+    }
 
 
 def request_run_now() -> Dict[str, Any]:
     return {"ok": True, "runtime": SCHEDULER.request_run_now()}
+
+
+def request_delete_now() -> Dict[str, Any]:
+    return {"ok": True, "runtime": DELETE_SCHEDULER.request_run_now()}
 
 
 def inventory_snapshot() -> Dict[str, Any]:
@@ -99,6 +157,7 @@ def inventory_snapshot() -> Dict[str, Any]:
             "ok": True,
             "stats": service.stats(),
             "aliases": service.list_aliases(),
+            "accounts": service.list_accounts(),
         }
     except Exception as exc:
         return {
@@ -106,6 +165,7 @@ def inventory_snapshot() -> Dict[str, Any]:
             "error": redact_log_line(str(exc))[:300],
             "stats": {},
             "aliases": [],
+            "accounts": [],
         }
 
 
@@ -118,5 +178,29 @@ def sync_inventory() -> Dict[str, Any]:
             "sync": sync,
             "stats": service.stats(),
             "aliases": service.list_aliases(),
+            "accounts": service.list_accounts(),
         },
     }
+
+
+def add_account(cookies: str, name: str = "") -> Dict[str, Any]:
+    service = _inventory_service()
+    result = service.add_account(cookies, name=name)
+    result["accounts"] = service.list_accounts()
+    return result
+
+
+def update_account(account_id: str, **fields) -> Dict[str, Any]:
+    service = _inventory_service()
+    result = service.update_account(account_id, **fields)
+    result["accounts"] = service.list_accounts()
+    return result
+
+
+def delete_account(account_id: str) -> Dict[str, Any]:
+    service = _inventory_service()
+    result = service.delete_account(account_id, delete_remote=True)
+    result["accounts"] = service.list_accounts()
+    result["aliases"] = service.list_aliases()
+    result["stats"] = service.stats()
+    return result

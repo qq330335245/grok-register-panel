@@ -4,6 +4,7 @@
 
 ### Added
 
+- iCloud multi-account cookies: inventory lists every alias with its owning Apple account, accounts can be deleted (aliases removed locally and on Apple), auto-create can target selected accounts, and registered aliases can be auto-deleted on an interval/batch/min-age/keep-last policy.
 - Auto-inject `MONITOR_TOKEN` into the live panel when the browser is on loopback (SSH tunnel / 127.0.0.1), so local testing does not require pasting the token.
 - Expand grok2api-style `{account}` / `{email}` / `{id}` sticky proxy templates per mailbox so one residential node can pin a unique exit to each registered account.
 - Add an `icloud` email provider that leases Apple Hide My Email aliases from a local inventory, receives xAI codes via the Cloudflare Temp-Mail admin inbox, and exposes inventory sync plus timed auto-create in the live panel.

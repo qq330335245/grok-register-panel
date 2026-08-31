@@ -297,6 +297,49 @@ FIELD_DEFINITIONS = {
         "min": 1,
         "max": 1000,
     },
+    "icloud_auto_create_account_ids": {
+        "label": "自动创建账户（逗号分隔，空=全部）",
+        "type": "text",
+        "placeholder": "留空表示所有启用账户",
+    },
+    "icloud_auto_delete_enabled": {
+        "label": "启用定时删除已注册别名",
+        "type": "bool",
+        "default": False,
+    },
+    "icloud_auto_delete_interval_minutes": {
+        "label": "删除间隔（分钟）",
+        "type": "int",
+        "default": 120,
+        "min": 1,
+        "max": 1440,
+    },
+    "icloud_auto_delete_batch_size": {
+        "label": "每次删除数量",
+        "type": "int",
+        "default": 5,
+        "min": 1,
+        "max": 50,
+    },
+    "icloud_auto_delete_min_age_hours": {
+        "label": "注册后最少保留（小时）",
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "max": 8760,
+    },
+    "icloud_auto_delete_keep_last": {
+        "label": "至少保留已注册条数",
+        "type": "int",
+        "default": 0,
+        "min": 0,
+        "max": 10000,
+    },
+    "icloud_auto_delete_account_ids": {
+        "label": "自动删除账户（逗号分隔，空=全部）",
+        "type": "text",
+        "placeholder": "留空表示所有账户",
+    },
 }
 
 PROVIDER_FIELDS = {
@@ -350,6 +393,13 @@ PROVIDER_FIELDS = {
         "icloud_auto_create_batch_size",
         "icloud_low_watermark",
         "icloud_high_watermark",
+        "icloud_auto_create_account_ids",
+        "icloud_auto_delete_enabled",
+        "icloud_auto_delete_interval_minutes",
+        "icloud_auto_delete_batch_size",
+        "icloud_auto_delete_min_age_hours",
+        "icloud_auto_delete_keep_last",
+        "icloud_auto_delete_account_ids",
     ),
 }
 

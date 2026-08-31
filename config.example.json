@@ -82,6 +82,13 @@
   "icloud_auto_create_enabled": false,
   "icloud_auto_create_interval_minutes": 60,
   "icloud_auto_create_batch_size": 1,
+  "icloud_auto_create_account_ids": "",
+  "icloud_auto_delete_enabled": false,
+  "icloud_auto_delete_interval_minutes": 120,
+  "icloud_auto_delete_batch_size": 5,
+  "icloud_auto_delete_min_age_hours": 0,
+  "icloud_auto_delete_keep_last": 0,
+  "icloud_auto_delete_account_ids": "",
   "icloud_fail_cooldown_sec": 1800,
   "icloud_fail_cooldown_max_sec": 86400,
   "icloud_fail_cooldown_threshold": 3

@@ -60,12 +60,16 @@ try:
         test_delivery_config,
     )
     from webui.icloud_ops import (
+        add_account as add_icloud_account,
+        delete_account as delete_icloud_account,
         inventory_snapshot as icloud_inventory_snapshot,
         notify_config_updated as notify_icloud_config_updated,
+        request_delete_now as request_icloud_delete_now,
         request_run_now as request_icloud_run_now,
         runtime_snapshot as icloud_runtime_snapshot,
         start_scheduler as start_icloud_scheduler,
         sync_inventory as sync_icloud_inventory,
+        update_account as update_icloud_account,
     )
     from webui.process_utils import (
         find_managed_processes,
@@ -117,12 +121,16 @@ except ImportError:  # running as script from webui/
         test_delivery_config,
     )
     from icloud_ops import (  # type: ignore
+        add_account as add_icloud_account,
+        delete_account as delete_icloud_account,
         inventory_snapshot as icloud_inventory_snapshot,
         notify_config_updated as notify_icloud_config_updated,
+        request_delete_now as request_icloud_delete_now,
         request_run_now as request_icloud_run_now,
         runtime_snapshot as icloud_runtime_snapshot,
         start_scheduler as start_icloud_scheduler,
         sync_inventory as sync_icloud_inventory,
+        update_account as update_icloud_account,
     )
     from process_utils import (  # type: ignore
         find_managed_processes,
@@ -1662,6 +1670,10 @@ HTML = r"""<!DOCTYPE html>
   .icloud-ops-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .icloud-ops-table th, .icloud-ops-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
   .icloud-ops-log { min-height: 72px; max-height: 140px; overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; white-space: pre-wrap; font-size: 11px; }
+  .icloud-account-box { margin-top: 4px; display: grid; gap: 8px; }
+  .icloud-account-box h4 { margin: 8px 0 0; font-size: 13px; }
+  .icloud-account-add { display: grid; gap: 8px; }
+  .icloud-account-add textarea { min-height: 64px; }
   .mail-secret-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
   .mail-secret-wrap button { min-width: 54px; min-height: 40px; padding-inline: 10px; font-size: 11px; }
   .mail-secret-wrap.pending-clear input { border-color: var(--warn); }
@@ -2341,12 +2353,27 @@ HTML = r"""<!DOCTYPE html>
           <div class="icloud-ops-actions">
             <button id="icloud-sync-button" onclick="syncIcloudInventory()">立即同步 Apple</button>
             <button class="primary" id="icloud-run-now-button" onclick="runIcloudCreateNow()">立即创建一批</button>
+            <button id="icloud-delete-now-button" onclick="runIcloudDeleteNow()">立即删除一批已注册</button>
             <span class="mail-provider-meta mono" id="icloud-next-run">下次计划 --</span>
+          </div>
+          <div class="icloud-account-box">
+            <h4>Apple 账户</h4>
+            <div class="icloud-account-add">
+              <input id="icloud-account-name" type="text" placeholder="账户备注（可选）" autocomplete="off"/>
+              <textarea id="icloud-account-cookies" rows="2" placeholder="粘贴该账户的 iCloud Cookies" spellcheck="false" autocomplete="off"></textarea>
+              <button class="primary" id="icloud-account-add" onclick="addIcloudAccount()">添加账户</button>
+            </div>
+            <div class="icloud-ops-table-wrap">
+              <table class="icloud-ops-table">
+                <thead><tr><th>账户</th><th>ID</th><th>别名数</th><th>自动创建</th><th>操作</th></tr></thead>
+                <tbody id="icloud-account-rows"><tr><td colspan="5">尚未读取账户</td></tr></tbody>
+              </table>
+            </div>
           </div>
           <div class="icloud-ops-table-wrap">
             <table class="icloud-ops-table">
-              <thead><tr><th>别名邮箱</th><th>状态</th><th>标签 / 标记</th><th>失败原因</th></tr></thead>
-              <tbody id="icloud-inventory-rows"><tr><td colspan="4">尚未读取库存</td></tr></tbody>
+              <thead><tr><th>别名邮箱</th><th>所属账户</th><th>状态</th><th>标签 / 标记</th><th>失败原因</th></tr></thead>
+              <tbody id="icloud-inventory-rows"><tr><td colspan="5">尚未读取库存</td></tr></tbody>
             </table>
           </div>
           <pre class="icloud-ops-log" id="icloud-scheduler-log">等待调度状态</pre>
@@ -3445,10 +3472,30 @@ function renderIcloudInventory(data) {
   const body = document.getElementById("icloud-inventory-rows");
   const aliases = (data && data.aliases) || [];
   if (!aliases.length) {
-    body.innerHTML = `<tr><td colspan="4">${esc((data && data.error) || "暂无本地库存")}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5">${esc((data && data.error) || "暂无本地库存")}</td></tr>`;
     return;
   }
-  body.innerHTML = aliases.map(alias => `<tr><td>${esc(alias.email || "-")}</td><td>${esc(alias.state || "-")}</td><td>${esc([alias.label, ...(alias.note_tags || [])].filter(Boolean).join(" / ") || "-")}</td><td>${esc(alias.last_fail_reason || "-")}</td></tr>`).join("");
+  body.innerHTML = aliases.map(alias => `<tr><td>${esc(alias.email || "-")}</td><td>${esc(alias.account_name || alias.account_id || "-")}</td><td>${esc(alias.state || "-")}</td><td>${esc([alias.label, ...(alias.note_tags || [])].filter(Boolean).join(" / ") || "-")}</td><td>${esc(alias.last_fail_reason || "-")}</td></tr>`).join("");
+}
+function renderIcloudAccounts(data, runtime) {
+  const body = document.getElementById("icloud-account-rows");
+  if (!body) return;
+  const accounts = (data && data.accounts) || [];
+  const selected = new Set((runtime && runtime.create_account_ids) || []);
+  if (!accounts.length) {
+    body.innerHTML = `<tr><td colspan="5">${esc((data && data.error) || "还没有 Apple 账户，请在上方添加 Cookies")}</td></tr>`;
+    return;
+  }
+  body.innerHTML = accounts.map(account => {
+    const checked = !selected.size || selected.has(account.id) ? "checked" : "";
+    return `<tr>
+      <td>${esc(account.name || account.id)}</td>
+      <td class="mono">${esc(account.id)}</td>
+      <td>${esc(account.alias_count || 0)}</td>
+      <td><label><input type="checkbox" data-icloud-create-id value="${esc(account.id)}" ${checked} onchange="saveIcloudCreateAccounts()"/> 参与创建</label></td>
+      <td><button class="danger" onclick="deleteIcloudAccount('${esc(account.id)}')">删除</button></td>
+    </tr>`;
+  }).join("");
 }
 function renderIcloudRuntime(runtime) {
   const labels = { idle: "等待中", running: "创建中", success: "上次成功", partial: "部分成功", failed: "上次失败" };
@@ -3473,6 +3520,7 @@ async function refreshIcloudOps() {
     ]);
     renderIcloudRuntime(runtime.runtime || {});
     renderIcloudInventory(inventory);
+    renderIcloudAccounts(inventory, runtime);
   } catch (e) {
     document.getElementById("icloud-scheduler-log").textContent = String(e.message || e);
   }
@@ -3483,7 +3531,9 @@ async function syncIcloudInventory() {
   setMsg("mail-provider-msg", "正在同步 Apple 别名...", "");
   try {
     const result = await api("/api/icloud-inventory/sync", { method: "POST", body: "{}" });
-    renderIcloudInventory(result.inventory || result);
+    const inventory = result.inventory || result;
+    renderIcloudInventory(inventory);
+    renderIcloudAccounts(inventory);
     setMsg("mail-provider-msg", "Apple 别名同步完成", "ok");
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
   button.disabled = false;
@@ -3498,6 +3548,49 @@ async function runIcloudCreateNow() {
     setMsg("mail-provider-msg", "已开始创建一批 iCloud 别名", "ok");
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
   button.disabled = false;
+}
+async function runIcloudDeleteNow() {
+  const button = document.getElementById("icloud-delete-now-button");
+  button.disabled = true;
+  setMsg("mail-provider-msg", "已请求立即删除已注册别名...", "");
+  try {
+    const result = await api("/api/icloud-auto-delete/run-now", { method: "POST", body: "{}" });
+    renderIcloudRuntime(result.runtime || {});
+    setMsg("mail-provider-msg", "已开始删除一批已注册别名", "ok");
+    refreshIcloudOps();
+  } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+async function addIcloudAccount() {
+  const cookies = document.getElementById("icloud-account-cookies").value;
+  const name = document.getElementById("icloud-account-name").value;
+  setMsg("mail-provider-msg", "正在添加 Apple 账户...", "");
+  try {
+    const result = await api("/api/icloud-accounts", { method: "POST", body: JSON.stringify({ cookies, name }) });
+    document.getElementById("icloud-account-cookies").value = "";
+    renderIcloudAccounts(result);
+    setMsg("mail-provider-msg", "已添加 Apple 账户", "ok");
+    refreshIcloudOps();
+  } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
+}
+async function deleteIcloudAccount(id) {
+  if (!confirm("删除该 Apple 账户，并移除其在库存中的别名？")) return;
+  try {
+    const result = await api("/api/icloud-accounts/" + encodeURIComponent(id), { method: "DELETE" });
+    renderIcloudAccounts(result);
+    renderIcloudInventory(result);
+    setMsg("mail-provider-msg", "账户及其别名已移除", "ok");
+  } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
+}
+async function saveIcloudCreateAccounts() {
+  const ids = Array.from(document.querySelectorAll("[data-icloud-create-id]:checked")).map(el => el.value);
+  try {
+    await api("/api/email-provider", { method: "POST", body: JSON.stringify({
+      provider: "icloud",
+      settings: { icloud_auto_create_account_ids: ids.join(",") },
+    }) });
+    setMsg("mail-provider-msg", "已更新自动创建账户", "ok");
+  } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
 }
 function domainStatusLabel(status) {
   return ({ active: "轮换中", standby: "待命", blocked: "已拉黑", disabled: "已停用" })[status] || "待命";
@@ -4630,6 +4723,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/icloud-auto-delete/run-now":
+            try:
+                self._json(200, request_icloud_delete_now())
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/icloud-accounts":
+            try:
+                self._json(200, add_icloud_account(str((body or {}).get("cookies") or ""), str((body or {}).get("name") or "")))
+            except ValueError as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
         if u.path == "/api/icloud-inventory/sync":
             try:
                 self._json(200, sync_icloud_inventory())
@@ -4744,18 +4851,22 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         proxy_match = re.fullmatch(r"/api/proxies/([a-f0-9]{20})", u.path)
         domain_match = re.fullmatch(r"/api/email-domains/([a-f0-9]{20})", u.path)
-        if proxy_match is None and domain_match is None:
+        icloud_match = re.fullmatch(r"/api/icloud-accounts/([^/]+)", u.path)
+        if proxy_match is None and domain_match is None and icloud_match is None:
             self._send(404, b"not found", "text/plain")
             return
         if not self._require_write():
             return
         try:
-            result = (
-                delete_proxy(proxy_match.group(1))
-                if proxy_match is not None
-                else delete_domain(domain_match.group(1))
-            )
+            if icloud_match is not None:
+                result = delete_icloud_account(unquote(icloud_match.group(1)))
+            elif proxy_match is not None:
+                result = delete_proxy(proxy_match.group(1))
+            else:
+                result = delete_domain(domain_match.group(1))
             self._json(200 if result.get("ok") else 404, result)
+        except ValueError as exc:
+            self._json(400, {"ok": False, "error": redact_log_line(str(exc))})
         except Exception as exc:
             self._json(500, {"ok": False, "error": redact_log_line(str(exc))})
 

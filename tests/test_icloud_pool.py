@@ -31,6 +31,7 @@ class FakeClient:
         self._aliases = list(aliases or [])
         self.update_calls = []
         self.create_calls = []
+        self.delete_calls = []
         self.list_calls = 0
 
     def list_aliases(self):
@@ -52,6 +53,13 @@ class FakeClient:
         a = _alias(email, f"nid-{len(self.create_calls)}", note=note or "")
         self._aliases.append(a)
         return a
+
+    def deactivate_alias(self, anonymous_id):
+        return None
+
+    def delete_alias(self, anonymous_id):
+        self.delete_calls.append(anonymous_id)
+        self._aliases = [a for a in self._aliases if a.anonymous_id != anonymous_id]
 
     def close(self):
         return None
@@ -552,6 +560,103 @@ class AliasLeaseServiceTests(unittest.TestCase):
                     args = m.call_args[0][0]
                     self.assertEqual({r.email for r in args}, {"a@icloud.com", "b@icloud.com", "c@icloud.com"})
 
+
+
+class MultiAccountTests(unittest.TestCase):
+    def setUp(self):
+        pool.reset_services_for_tests()
+
+    def tearDown(self):
+        pool.reset_services_for_tests()
+
+    def test_create_and_list_account_column(self):
+        with tempfile.TemporaryDirectory() as td:
+            inv = str(Path(td) / "inv.db")
+            fake = FakeClient()
+            cookies = {"X-APPLE-WEBAUTH-USER": "dsid=123"}
+            with patch("email_providers.icloud_pool.hme.ICloudHideMyEmailClient", return_value=fake), patch(
+                "email_providers.icloud_pool.hme.parse_icloud_account_cookies", return_value=cookies
+            ), patch(
+                "email_providers.icloud_pool.hme.derive_icloud_dsid", return_value="123"
+            ):
+                svc = pool.AliasLeaseService(
+                    cookies_raw="dummy",
+                    inventory_path=inv,
+                    auto_start_background=False,
+                    background_replenish=False,
+                    async_mark=False,
+                )
+                added = svc.add_account("dummy", name="main")
+                self.assertEqual(added["account"]["id"], "123")
+                created = svc.create_free_aliases(1, account_ids=["123"])
+                self.assertEqual(created["created_count"], 1)
+                rows = svc.list_aliases()
+                self.assertEqual(rows[0]["account_id"], "123")
+                self.assertEqual(rows[0]["account_name"], "main")
+
+    def test_delete_account_removes_aliases(self):
+        with tempfile.TemporaryDirectory() as td:
+            inv = str(Path(td) / "inv.db")
+            fake = FakeClient()
+            cookies = {"X-APPLE-WEBAUTH-USER": "dsid=9"}
+            with patch("email_providers.icloud_pool.hme.ICloudHideMyEmailClient", return_value=fake), patch(
+                "email_providers.icloud_pool.hme.parse_icloud_account_cookies", return_value=cookies
+            ), patch(
+                "email_providers.icloud_pool.hme.derive_icloud_dsid", return_value="9"
+            ):
+                svc = pool.AliasLeaseService(
+                    cookies_raw="dummy",
+                    inventory_path=inv,
+                    auto_start_background=False,
+                    background_replenish=False,
+                    async_mark=False,
+                )
+                svc.add_account("dummy", name="gone")
+                svc.create_free_aliases(1, account_ids=["9"])
+                self.assertEqual(svc.stats()["total"], 1)
+                result = svc.delete_account("9")
+                self.assertEqual(result["removed_aliases"], 1)
+                self.assertEqual(svc.list_accounts(), [])
+                self.assertEqual(svc.list_aliases(), [])
+
+    def test_delete_registered_respects_keep_last(self):
+        with tempfile.TemporaryDirectory() as td:
+            inv = str(Path(td) / "inv.db")
+            fake = FakeClient()
+            cookies = {"x": "1"}
+            with patch("email_providers.icloud_pool.hme.ICloudHideMyEmailClient", return_value=fake), patch(
+                "email_providers.icloud_pool.hme.parse_icloud_account_cookies", return_value=cookies
+            ):
+                svc = pool.AliasLeaseService(
+                    cookies_raw="dummy",
+                    inventory_path=inv,
+                    auto_start_background=False,
+                    background_replenish=False,
+                    async_mark=False,
+                )
+                now = time.time()
+                with svc._tx() as conn:
+                    data = svc._load_unlocked(conn)
+                    records = svc._records(data)
+                    records["old@icloud.com"] = pool.AliasRecord(
+                        email="old@icloud.com",
+                        anonymous_id="a1",
+                        state=pool.STATE_REGISTERED,
+                        last_marked_at=now - 1000,
+                    )
+                    records["new@icloud.com"] = pool.AliasRecord(
+                        email="new@icloud.com",
+                        anonymous_id="a2",
+                        state=pool.STATE_REGISTERED,
+                        last_marked_at=now,
+                    )
+                    svc._dump_records(data, records)
+                    svc._save_unlocked(data, conn)
+                result = svc.delete_registered_aliases(10, keep_last=1)
+                self.assertEqual(result["deleted_count"], 1)
+                self.assertEqual(result["emails"], ["old@icloud.com"])
+                remaining = {row["email"] for row in svc.list_aliases()}
+                self.assertEqual(remaining, {"new@icloud.com"})
 
 
 if __name__ == "__main__":

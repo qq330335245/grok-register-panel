@@ -285,8 +285,6 @@ def acquire_lease(
 ):
     """Acquire an alias lease via local inventory pool."""
     cookies_raw = str(cookies_raw or "").strip()
-    if not cookies_raw:
-        raise Exception("未配置 icloud_cookies")
 
     _ = used_file, note, accounts_root, use_local_used
 
@@ -389,10 +387,6 @@ def commit_registration(
     label: str = "grok",
 ) -> None:
     cookies_raw = str(cookies_raw or "").strip()
-    if not cookies_raw:
-        if log_callback:
-            log_callback("[!] commit_registration: 缺少 icloud_cookies，跳过云标记")
-        return
     service = alias_pool.get_lease_service(
         cookies_raw,
         inventory_path=inventory_path or alias_pool.DEFAULT_INVENTORY_FILE,
@@ -425,8 +419,6 @@ def release_registration(
     label: str = "grok",
 ) -> None:
     cookies_raw = str(cookies_raw or "").strip()
-    if not cookies_raw:
-        return
     service = alias_pool.get_lease_service(
         cookies_raw,
         inventory_path=inventory_path or alias_pool.DEFAULT_INVENTORY_FILE,

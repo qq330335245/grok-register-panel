@@ -131,10 +131,12 @@ class AliasRecord:
     fail_count: int = 0
     last_fail_reason: str = ""
     is_active: bool = True
+    account_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "email": self.email,
+            "account_id": self.account_id,
             "anonymous_id": self.anonymous_id,
             "label": self.label,
             "hme_from_key": self.hme_from_key,
@@ -182,6 +184,7 @@ class AliasRecord:
             fail_count=int(data.get("fail_count") or 0),
             last_fail_reason=str(data.get("last_fail_reason") or ""),
             is_active=bool(data.get("is_active", True)),
+            account_id=str(data.get("account_id") or "").strip(),
         )
 
 
@@ -292,8 +295,6 @@ class AliasLeaseService:
         auto_start_background: bool = True,
     ) -> None:
         self.cookies_raw = str(cookies_raw or "").strip()
-        if not self.cookies_raw:
-            raise ValueError("未配置 icloud_cookies")
         self.inventory_path = _resolve_path(inventory_path)
         self.lock_path = self.inventory_path + ".lock"
         self.platform = (str(platform or DEFAULT_PLATFORM).strip().lower() or DEFAULT_PLATFORM)
@@ -325,6 +326,7 @@ class AliasLeaseService:
         self._bg_log: LogFn = None
         self._bg_mu = threading.Lock()
         self._last_replenish_at = 0.0
+        self._schema_ready = False
         if auto_start_background and (self.async_mark or self.background_replenish):
             self.start_background()
 
@@ -363,8 +365,10 @@ class AliasLeaseService:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
-        self._ensure_schema(conn)
-        self._maybe_migrate_json(conn)
+        if not self._schema_ready:
+            self._ensure_schema(conn)
+            self._maybe_migrate_json(conn)
+            self._schema_ready = True
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
@@ -398,6 +402,15 @@ class AliasLeaseService:
                 key TEXT PRIMARY KEY,
                 value REAL NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                cookies TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL DEFAULT 0,
+                last_sync_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT ''
+            );
             CREATE INDEX IF NOT EXISTS idx_aliases_state_active
                 ON aliases(state, is_active);
             """
@@ -412,10 +425,15 @@ class AliasLeaseService:
             "cooldown_until": "REAL NOT NULL DEFAULT 0",
             "fail_count": "INTEGER NOT NULL DEFAULT 0",
             "last_fail_reason": "TEXT NOT NULL DEFAULT ''",
+            "account_id": "TEXT NOT NULL DEFAULT ''",
         }
         for col, decl in alter_map.items():
             if col not in cols:
                 conn.execute(f"ALTER TABLE aliases ADD COLUMN {col} {decl}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_aliases_account ON aliases(account_id)"
+        )
+        self._migrate_legacy_account(conn)
 
         for key in METRIC_KEYS:
             conn.execute(
@@ -433,6 +451,199 @@ class AliasLeaseService:
         conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('last_full_sync_at', '0')",
         )
+
+    def _account_id_from_cookies(self, cookies_raw: str) -> str:
+        raw = str(cookies_raw or "").strip()
+        if not raw:
+            raise ValueError("cookies 为空")
+        try:
+            cookies = hme.parse_icloud_account_cookies(raw)
+            return str(hme.derive_icloud_dsid(cookies) or "").strip()
+        except Exception:
+            import hashlib
+
+            return "c" + hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+    def _migrate_legacy_account(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()
+        if row and int(row["c"] or 0) > 0:
+            if self.cookies_raw:
+                conn.execute(
+                    "UPDATE aliases SET account_id=? WHERE account_id=''",
+                    (self._account_id_from_cookies(self.cookies_raw),),
+                )
+            return
+        if not self.cookies_raw:
+            return
+        account_id = self._account_id_from_cookies(self.cookies_raw)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO accounts(id, name, cookies, enabled, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (account_id, "default", self.cookies_raw, _now()),
+        )
+        conn.execute(
+            "UPDATE aliases SET account_id=? WHERE account_id=''",
+            (account_id,),
+        )
+
+    def _account_row(self, conn: sqlite3.Connection, account_id: str) -> Optional[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM accounts WHERE id=?",
+            (str(account_id or "").strip(),),
+        ).fetchone()
+
+    def _public_account(self, row: sqlite3.Row, alias_counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+        account_id = str(row["id"] or "")
+        counts = alias_counts or {}
+        return {
+            "id": account_id,
+            "name": str(row["name"] or "") or account_id,
+            "enabled": bool(int(row["enabled"] or 0)),
+            "created_at": float(row["created_at"] or 0),
+            "last_sync_at": float(row["last_sync_at"] or 0),
+            "last_error": str(row["last_error"] or ""),
+            "has_cookies": bool(str(row["cookies"] or "").strip()),
+            "alias_count": int(counts.get(account_id) or 0),
+        }
+
+    def list_accounts(self) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            counts: Dict[str, int] = {}
+            for row in conn.execute(
+                "SELECT account_id, COUNT(*) AS c FROM aliases GROUP BY account_id"
+            ):
+                counts[str(row["account_id"] or "")] = int(row["c"] or 0)
+            return [
+                self._public_account(row, counts)
+                for row in conn.execute("SELECT * FROM accounts ORDER BY created_at ASC, id ASC")
+            ]
+        finally:
+            conn.close()
+
+    def enabled_account_ids(self) -> List[str]:
+        return [item["id"] for item in self.list_accounts() if item.get("enabled") and item.get("has_cookies")]
+
+    def cookies_for(self, account_id: str = "") -> str:
+        aid = str(account_id or "").strip()
+        if not aid and self.cookies_raw:
+            return self.cookies_raw
+        conn = self._connect()
+        try:
+            if aid:
+                row = self._account_row(conn, aid)
+                if row and str(row["cookies"] or "").strip():
+                    return str(row["cookies"])
+            if self.cookies_raw:
+                return self.cookies_raw
+            row = conn.execute(
+                "SELECT cookies FROM accounts WHERE enabled=1 AND cookies!='' ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+            if row and str(row["cookies"] or "").strip():
+                return str(row["cookies"])
+        finally:
+            conn.close()
+        raise ValueError("未配置 iCloud 账户 Cookies")
+
+    def add_account(self, cookies_raw: str, *, name: str = "") -> Dict[str, Any]:
+        raw = str(cookies_raw or "").strip()
+        if not raw:
+            raise ValueError("cookies 为空")
+        account_id = self._account_id_from_cookies(raw)
+        label = str(name or "").strip() or account_id
+        with self._tx() as conn:
+            existing = self._account_row(conn, account_id)
+            if existing:
+                conn.execute(
+                    "UPDATE accounts SET cookies=?, name=CASE WHEN ?!='' THEN ? ELSE name END, enabled=1, last_error='' WHERE id=?",
+                    (raw, label, label, account_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO accounts(id, name, cookies, enabled, created_at) VALUES (?, ?, ?, 1, ?)",
+                    (account_id, label, raw, _now()),
+                )
+        return {"ok": True, "account": next(a for a in self.list_accounts() if a["id"] == account_id)}
+
+    def update_account(
+        self,
+        account_id: str,
+        *,
+        name: Optional[str] = None,
+        cookies_raw: Optional[str] = None,
+        enabled: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        aid = str(account_id or "").strip()
+        if not aid:
+            raise ValueError("account_id 为空")
+        with self._tx() as conn:
+            row = self._account_row(conn, aid)
+            if not row:
+                raise ValueError("账户不存在")
+            new_name = row["name"] if name is None else str(name or "").strip()
+            new_cookies = row["cookies"] if cookies_raw is None else str(cookies_raw or "").strip()
+            new_enabled = int(row["enabled"] or 0) if enabled is None else (1 if enabled else 0)
+            if cookies_raw is not None and new_cookies:
+                derived = self._account_id_from_cookies(new_cookies)
+                if derived and derived != aid:
+                    raise ValueError("Cookies 属于另一个 Apple 账户，请新增账户而不是覆盖")
+            conn.execute(
+                "UPDATE accounts SET name=?, cookies=?, enabled=? WHERE id=?",
+                (new_name, new_cookies, new_enabled, aid),
+            )
+        return {"ok": True, "account": next(a for a in self.list_accounts() if a["id"] == aid)}
+
+    def delete_account(self, account_id: str, *, delete_remote: bool = True) -> Dict[str, Any]:
+        aid = str(account_id or "").strip()
+        if not aid:
+            raise ValueError("account_id 为空")
+        removed = 0
+        remote_errors: List[str] = []
+        with self._tx() as conn:
+            row = self._account_row(conn, aid)
+            if not row:
+                raise ValueError("账户不存在")
+            cookies = str(row["cookies"] or "")
+            aliases = list(
+                conn.execute(
+                    "SELECT email, anonymous_id FROM aliases WHERE account_id=?",
+                    (aid,),
+                )
+            )
+        if delete_remote and cookies:
+            try:
+                client = hme.ICloudHideMyEmailClient(
+                    hme.parse_icloud_account_cookies(cookies), timeout=self.timeout
+                )
+                try:
+                    for item in aliases:
+                        anon = str(item["anonymous_id"] or "").strip()
+                        if not anon:
+                            continue
+                        try:
+                            try:
+                                client.deactivate_alias(anon)
+                            except Exception:
+                                pass
+                            client.delete_alias(anon)
+                        except Exception as exc:
+                            remote_errors.append(f"{item['email']}: {exc}")
+                finally:
+                    client.close()
+            except Exception as exc:
+                remote_errors.append(str(exc))
+        with self._tx() as conn:
+            cur = conn.execute("DELETE FROM aliases WHERE account_id=?", (aid,))
+            removed = int(cur.rowcount or 0)
+            conn.execute("DELETE FROM accounts WHERE id=?", (aid,))
+        return {
+            "ok": True,
+            "account_id": aid,
+            "removed_aliases": removed,
+            "remote_errors": remote_errors[:8],
+        }
 
     def _maybe_migrate_json(self, conn: sqlite3.Connection) -> None:
         row = conn.execute("SELECT COUNT(*) AS c FROM aliases").fetchone()
@@ -488,8 +699,9 @@ class AliasLeaseService:
             INSERT INTO aliases(
                 email, anonymous_id, label, hme_from_key, note_tags, state, lease_id, lease_owner,
                 lease_expires_at, last_seen_at, last_marked_at, mark_pending,
-                mark_attempts, mark_next_retry_at, cooldown_until, fail_count, last_fail_reason, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                mark_attempts, mark_next_retry_at, cooldown_until, fail_count, last_fail_reason, is_active,
+                account_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 anonymous_id=excluded.anonymous_id,
                 label=excluded.label,
@@ -507,7 +719,8 @@ class AliasLeaseService:
                 cooldown_until=excluded.cooldown_until,
                 fail_count=excluded.fail_count,
                 last_fail_reason=excluded.last_fail_reason,
-                is_active=excluded.is_active
+                is_active=excluded.is_active,
+                account_id=CASE WHEN excluded.account_id != '' THEN excluded.account_id ELSE aliases.account_id END
             """,
             (
                 rec.email,
@@ -528,6 +741,7 @@ class AliasLeaseService:
                 int(rec.fail_count or 0),
                 str(rec.last_fail_reason or "")[:200],
                 1 if rec.is_active else 0,
+                str(rec.account_id or ""),
             ),
         )
 
@@ -591,6 +805,7 @@ class AliasLeaseService:
                     fail_count=int(row["fail_count"] or 0) if "fail_count" in keys else 0,
                     last_fail_reason=str(row["last_fail_reason"] or "") if "last_fail_reason" in keys else "",
                     is_active=bool(int(row["is_active"] or 0)),
+                    account_id=str(row["account_id"] or "") if "account_id" in keys else "",
                 )
                 if rec.email:
                     aliases[rec.email] = rec.to_dict()
@@ -802,12 +1017,12 @@ class AliasLeaseService:
             mark_pending=bool(mark_pending),
         )
 
-    def _lookup_remote_label(self, anonymous_id: str) -> str:
+    def _lookup_remote_label(self, anonymous_id: str, account_id: str = "") -> str:
         """Fetch current Apple HME label so we can preserve it on note-only updates."""
         anon = str(anonymous_id or "").strip()
         if not anon:
             return ""
-        cookies = hme.parse_icloud_account_cookies(self.cookies_raw)
+        cookies = hme.parse_icloud_account_cookies(self.cookies_for(account_id))
         client = hme.ICloudHideMyEmailClient(cookies, timeout=self.timeout)
         try:
             for item in client.list_aliases():
@@ -830,7 +1045,7 @@ class AliasLeaseService:
 
         # Preserve existing label only. Never invent/overwrite with "grok".
         label = str(rec.label or "").strip()
-        cookies = hme.parse_icloud_account_cookies(self.cookies_raw)
+        cookies = hme.parse_icloud_account_cookies(self.cookies_for(rec.account_id))
         client = hme.ICloudHideMyEmailClient(cookies, timeout=self.timeout)
         try:
             try:
@@ -842,7 +1057,7 @@ class AliasLeaseService:
             except Exception as exc:
                 msg = str(exc).lower()
                 if "invalid label" in msg and not label:
-                    label = self._lookup_remote_label(anon)
+                    label = self._lookup_remote_label(anon, rec.account_id)
                     if not label:
                         raise
                     rec.label = label
@@ -867,13 +1082,20 @@ class AliasLeaseService:
         log_callback: LogFn = None,
         *,
         mark_platform: bool = True,
+        account_id: str = "",
     ) -> AliasRecord:
         create_note = (
             note_tags.note_add_platform("", self.platform)
             if self.cloud_mark and mark_platform
             else ""
         )
-        cookies = hme.parse_icloud_account_cookies(self.cookies_raw)
+        aid = str(account_id or "").strip()
+        cookies = hme.parse_icloud_account_cookies(self.cookies_for(aid))
+        if not aid:
+            try:
+                aid = self._account_id_from_cookies(self.cookies_for(aid))
+            except Exception:
+                aid = ""
         client = hme.ICloudHideMyEmailClient(cookies, timeout=self.timeout)
         try:
             alias = client.create_alias(label=self.label or self.platform, note=create_note)
@@ -893,26 +1115,39 @@ class AliasLeaseService:
             last_marked_at=_now() if self.cloud_mark else 0.0,
             mark_pending=False,
             is_active=True,
+            account_id=aid,
         )
         if log_callback:
             log_callback(f"[*] 已新建 iCloud 别名: {email} note={create_note or '-'}")
         return rec
 
-    def create_free_aliases(self, count: int, *, log_callback: LogFn = None) -> Dict[str, Any]:
+    def create_free_aliases(
+        self,
+        count: int,
+        *,
+        log_callback: LogFn = None,
+        account_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Create aliases for inventory without marking them as already registered."""
         target = max(1, int(count or 1))
+        selected = [str(item or "").strip() for item in (account_ids or []) if str(item or "").strip()]
+        if not selected:
+            selected = self.enabled_account_ids()
         result: Dict[str, Any] = {
             "requested_count": target,
             "created_count": 0,
             "failed_count": 0,
             "emails": [],
             "errors": [],
+            "account_ids": list(selected),
         }
-        for _ in range(target):
+        for index in range(target):
             try:
+                aid = selected[index % len(selected)] if selected else ""
                 created = self._create_remote_alias(
                     log_callback=log_callback,
                     mark_platform=False,
+                    account_id=aid,
                 )
                 with self._tx() as conn:
                     data = self._load_unlocked(conn)
@@ -940,70 +1175,99 @@ class AliasLeaseService:
                 break
         return result
 
+    def _apply_remote_aliases(
+        self,
+        records: Dict[str, AliasRecord],
+        remote_list: List[Any],
+        account_id: str,
+        now: float,
+    ) -> set:
+        seen = set()
+        aid = str(account_id or "").strip()
+        for item in remote_list:
+            email = _norm_email(getattr(item, "email", ""))
+            if not email:
+                continue
+            seen.add(email)
+            tags = note_tags.parse_note_tags(getattr(item, "note", "") or "")
+            anon = str(getattr(item, "anonymous_id", "") or "").strip()
+            is_active = bool(getattr(item, "is_active", True))
+            rec = records.get(email) or AliasRecord(email=email)
+            rec.email = email
+            rec.anonymous_id = anon or rec.anonymous_id
+            rec.account_id = aid or rec.account_id
+            apple_label = str(getattr(item, "label", "") or "").strip()
+            if apple_label:
+                rec.label = apple_label
+            rec.note_tags = tags
+            rec.is_active = is_active
+            rec.last_seen_at = now
+            remote_registered = self.platform in tags
+            if not is_active:
+                if remote_registered:
+                    rec.state = STATE_REGISTERED
+                rec.lease_id = ""
+                rec.lease_owner = ""
+                rec.lease_expires_at = 0.0
+                rec.mark_pending = False
+            elif remote_registered:
+                rec.state = STATE_REGISTERED
+                rec.lease_id = ""
+                rec.lease_owner = ""
+                rec.lease_expires_at = 0.0
+                rec.mark_pending = False
+            else:
+                if rec.state == STATE_LEASED and float(rec.lease_expires_at or 0) > now:
+                    pass
+                else:
+                    rec.state = STATE_FREE
+                    rec.lease_id = ""
+                    rec.lease_owner = ""
+                    rec.lease_expires_at = 0.0
+                    rec.mark_pending = False
+            records[email] = rec
+        for email, rec in list(records.items()):
+            if (rec.account_id or "") != aid:
+                continue
+            if email in seen:
+                continue
+            if rec.state == STATE_FREE:
+                rec.is_active = False
+        return seen
+
     def _sync_from_apple(self, log_callback: LogFn = None) -> Dict[str, int]:
         def _run() -> Dict[str, int]:
             started = _now()
-            cookies = hme.parse_icloud_account_cookies(self.cookies_raw)
-            client = hme.ICloudHideMyEmailClient(cookies, timeout=self.timeout)
-            try:
-                remote_list = client.list_aliases()
-            finally:
-                client.close()
+            specs: List[Tuple[str, str]] = []
+            for acc in self.list_accounts():
+                if acc.get("enabled") and acc.get("has_cookies"):
+                    specs.append((str(acc["id"]), self.cookies_for(str(acc["id"]))))
+            if not specs and self.cookies_raw:
+                specs.append(("", self.cookies_raw))
+            if not specs:
+                raise ValueError("未配置 iCloud 账户 Cookies")
+            remote_by_account: List[Tuple[str, List[Any]]] = []
+            for aid, cookies in specs:
+                client = hme.ICloudHideMyEmailClient(
+                    hme.parse_icloud_account_cookies(cookies), timeout=self.timeout
+                )
+                try:
+                    remote_by_account.append((aid, list(client.list_aliases())))
+                finally:
+                    client.close()
 
             with self._tx() as conn:
                 data = self._load_unlocked(conn)
                 records = self._records(data)
                 self._expire_leases(records)
                 now = _now()
-                seen = set()
-                for item in remote_list:
-                    email = _norm_email(getattr(item, "email", ""))
-                    if not email:
-                        continue
-                    seen.add(email)
-                    tags = note_tags.parse_note_tags(getattr(item, "note", "") or "")
-                    anon = str(getattr(item, "anonymous_id", "") or "").strip()
-                    is_active = bool(getattr(item, "is_active", True))
-                    rec = records.get(email) or AliasRecord(email=email)
-                    rec.email = email
-                    rec.anonymous_id = anon or rec.anonymous_id
-                    apple_label = str(getattr(item, "label", "") or "").strip()
-                    if apple_label:
-                        rec.label = apple_label
-                    rec.note_tags = tags
-                    rec.is_active = is_active
-                    rec.last_seen_at = now
-                    remote_registered = self.platform in tags
-                    if not is_active:
-                        if remote_registered:
-                            rec.state = STATE_REGISTERED
-                        rec.lease_id = ""
-                        rec.lease_owner = ""
-                        rec.lease_expires_at = 0.0
-                        rec.mark_pending = False
-                    elif remote_registered:
-                        rec.state = STATE_REGISTERED
-                        rec.lease_id = ""
-                        rec.lease_owner = ""
-                        rec.lease_expires_at = 0.0
-                        rec.mark_pending = False
-                    else:
-                        if rec.state == STATE_LEASED and float(rec.lease_expires_at or 0) > now:
-                            pass
-                        else:
-                            rec.state = STATE_FREE
-                            rec.lease_id = ""
-                            rec.lease_owner = ""
-                            rec.lease_expires_at = 0.0
-                            rec.mark_pending = False
-                    records[email] = rec
-
-                for email, rec in list(records.items()):
-                    if email in seen:
-                        continue
-                    if rec.state == STATE_FREE:
-                        rec.is_active = False
-
+                for aid, remote_list in remote_by_account:
+                    self._apply_remote_aliases(records, remote_list, aid, now)
+                    if aid:
+                        conn.execute(
+                            "UPDATE accounts SET last_sync_at=?, last_error='' WHERE id=?",
+                            (now, aid),
+                        )
                 self._dump_records(data, records)
                 data["last_full_sync_at"] = now
                 elapsed_ms = max((_now() - started) * 1000.0, 0.0)
@@ -1012,9 +1276,10 @@ class AliasLeaseService:
                 self._save_unlocked(data, conn)
                 counts = self._counts(records)
                 counts["sync_duration_ms"] = elapsed_ms
+                counts["accounts"] = len(specs)
             if log_callback:
                 log_callback(
-                    f"[*] iCloud 库存同步完成: total={counts['total']} free={counts['free']} cooling={counts.get('cooling', 0)} "
+                    f"[*] iCloud 库存同步完成: accounts={counts.get('accounts', 0)} total={counts['total']} free={counts['free']} cooling={counts.get('cooling', 0)} "
                     f"leased={counts['leased']} registered={counts['registered']} "
                     f"({counts.get('sync_duration_ms', 0):.0f}ms)"
                 )
@@ -1563,9 +1828,92 @@ class AliasLeaseService:
                             self._bg_log(f"[!] 后台补货异常: {exc}")
                         self._last_replenish_at = _now()
 
+    def delete_registered_aliases(
+        self,
+        count: int,
+        *,
+        min_age_hours: float = 0,
+        keep_last: int = 0,
+        account_ids: Optional[List[str]] = None,
+        log_callback: LogFn = None,
+    ) -> Dict[str, Any]:
+        """Delete registered HME aliases on Apple and drop them from inventory."""
+        target = max(1, int(count or 1))
+        min_age = max(float(min_age_hours or 0), 0.0) * 3600.0
+        keep = max(int(keep_last or 0), 0)
+        selected = {str(item or "").strip() for item in (account_ids or []) if str(item or "").strip()}
+        cutoff = _now() - min_age if min_age else 0.0
+        with self._tx() as conn:
+            data = self._load_unlocked(conn)
+            records = self._records(data)
+            self._expire_leases(records)
+            candidates = [
+                rec
+                for rec in records.values()
+                if rec.state == STATE_REGISTERED
+                and rec.is_active
+                and (not selected or rec.account_id in selected)
+                and (not cutoff or float(rec.last_marked_at or rec.last_seen_at or 0) <= cutoff)
+            ]
+            candidates.sort(key=lambda rec: float(rec.last_marked_at or rec.last_seen_at or 0))
+            if keep:
+                newest = sorted(
+                    [
+                        rec
+                        for rec in records.values()
+                        if rec.state == STATE_REGISTERED and rec.is_active
+                    ],
+                    key=lambda rec: float(rec.last_marked_at or rec.last_seen_at or 0),
+                    reverse=True,
+                )[:keep]
+                keep_emails = {rec.email for rec in newest}
+                candidates = [rec for rec in candidates if rec.email not in keep_emails]
+            batch = candidates[:target]
+        result: Dict[str, Any] = {
+            "requested_count": target,
+            "deleted_count": 0,
+            "failed_count": 0,
+            "emails": [],
+            "errors": [],
+            "skipped": max(len(candidates) - len(batch), 0),
+        }
+        for rec in batch:
+            try:
+                cookies = self.cookies_for(rec.account_id)
+                client = hme.ICloudHideMyEmailClient(
+                    hme.parse_icloud_account_cookies(cookies), timeout=self.timeout
+                )
+                try:
+                    anon = str(rec.anonymous_id or "").strip()
+                    if anon:
+                        try:
+                            client.deactivate_alias(anon)
+                        except Exception:
+                            pass
+                        client.delete_alias(anon)
+                finally:
+                    client.close()
+                with self._tx() as conn:
+                    data = self._load_unlocked(conn)
+                    records = self._records(data)
+                    records.pop(rec.email, None)
+                    self._dump_records(data, records)
+                    self._save_unlocked(data, conn)
+                result["deleted_count"] += 1
+                result["emails"].append(rec.email)
+                if log_callback:
+                    log_callback(f"[*] 已删除已注册别名: {rec.email}")
+            except Exception as exc:
+                result["failed_count"] += 1
+                result["errors"].append(f"{rec.email}: {exc}")
+                if log_callback:
+                    log_callback(f"[!] 删除别名失败 {rec.email}: {exc}")
+        return result
+
     def list_aliases(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Return a bounded local inventory snapshot without contacting Apple."""
         maximum = max(1, min(int(limit or 200), 500))
+        names = {item["id"]: item.get("name") or item["id"] for item in self.list_accounts()}
         with self._tx() as conn:
             data = self._load_unlocked(conn)
             records = self._records(data)
@@ -1575,7 +1923,12 @@ class AliasLeaseService:
                 key=lambda item: (float(item.last_seen_at or 0), str(item.email or "")),
                 reverse=True,
             )
-            return [record.to_dict() for record in ordered[:maximum]]
+            rows = []
+            for record in ordered[:maximum]:
+                payload = record.to_dict()
+                payload["account_name"] = names.get(record.account_id) or record.account_id or "-"
+                rows.append(payload)
+            return rows
 
     def stats(self) -> Dict[str, Any]:
         with self._tx() as conn:
@@ -1643,9 +1996,10 @@ def get_lease_service(
     )
     with _service_mu:
         svc = _services.get(key)
-        if svc is None or svc.cookies_raw != str(cookies_raw or "").strip():
+        raw_cookies = str(cookies_raw or "").strip()
+        if svc is None:
             svc = AliasLeaseService(
-                cookies_raw=cookies_raw,
+                cookies_raw=raw_cookies,
                 inventory_path=inv,
                 platform=plat,
                 label=label,
@@ -1669,6 +2023,8 @@ def get_lease_service(
             )
             _services[key] = svc
         else:
+            if raw_cookies:
+                svc.cookies_raw = raw_cookies
             # keep live service cooldown knobs in sync with latest config
             svc.fail_cooldown_sec = max(float(fail_cooldown_sec or DEFAULT_FAIL_COOLDOWN_SEC), 1.0)
             svc.fail_cooldown_max_sec = max(

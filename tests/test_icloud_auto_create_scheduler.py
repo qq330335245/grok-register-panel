@@ -61,9 +61,9 @@ class ICloudInventoryCreateTests(unittest.TestCase):
                 auto_start_background=False,
             )
 
-            def fake_create(*, log_callback=None, mark_platform=True):
+            def fake_create(*, log_callback=None, mark_platform=True, account_id=""):
                 self.assertFalse(mark_platform)
-                return AliasRecord(email="ready@icloud.com", anonymous_id="alias-1")
+                return AliasRecord(email="ready@icloud.com", anonymous_id="alias-1", account_id=account_id)
 
             service._create_remote_alias = fake_create  # type: ignore[method-assign]
             result = service.create_free_aliases(1)

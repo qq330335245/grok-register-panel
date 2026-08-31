@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Relay authenticated SOCKS5 through a local no-auth listener before Camoufox/Firefox. Playwright Firefox rejects SOCKS5 username/password (`Browser does not support socks5 proxy authentication`); the previous `socks5h://user:pass@…` launch path did not actually authenticate and reset `accounts.x.ai`.
 - Disable Firefox HTTP/3 through SOCKS and retry `accounts.x.ai` navigation on `NS_ERROR_NET_RESET`, which IPv6 sticky exits commonly hit on Cloudflare.
 - After IPv4 SOCKS host-unreachable (code 4 / curl 97) on sticky residential exits, retry IPv6 IP probes (`v6.ipinfo.io`, Cloudflare IPv6 trace) instead of failing browser start.
 - Stop using leftover `config.proxy` (often `127.0.0.1:7890`) for the blocking xAI precheck when the panel proxy pool is configured but currently empty; require a healthy pool node instead, and expand sticky `{account}` templates for the probe check.

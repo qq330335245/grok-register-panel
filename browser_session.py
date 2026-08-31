@@ -50,6 +50,7 @@ from camoufox_adapter import CamoufoxBrowser, CamoufoxPage
 from batch_traffic import meter_proxy_url
 from retry_policy import browser_start_attempts
 from secure_files import ensure_private_dir
+from socks_auth_relay import wrap_firefox_proxy
 from webui.blacklist_store import read_blacklist
 from webui.security_utils import redact_log_line, redact_proxy
 
@@ -414,6 +415,35 @@ def is_blocked_exit_ip(ip: str) -> tuple:
     summary = f"{asn or '?'} | {isp or '?'} | {info.get('city') or '?'}"
     return False, summary
 
+
+
+def _stop_proxy_relay() -> None:
+    relay = getattr(_tls, "proxy_relay", None)
+    _tls.proxy_relay = None
+    if relay is None:
+        return
+    try:
+        relay.stop()
+    except Exception:
+        pass
+
+
+def _attach_firefox_proxy(opts: dict, log_callback=None) -> dict:
+    """Firefox cannot authenticate SOCKS5; locally relay when the URL has a user."""
+    raw = dict(opts.get("proxy") or {})
+    if not raw:
+        return opts
+    wrapped, relay = wrap_firefox_proxy(raw)
+    _stop_proxy_relay()
+    if relay is not None:
+        _tls.proxy_relay = relay
+        if log_callback:
+            log_callback(
+                f"[*] Firefox SOCKS5 认证已本地中继: {relay.local_server} -> "
+                f"{redact_proxy(str(raw.get('server') or ''))}"
+            )
+    opts["proxy"] = wrapped
+    return opts
 
 
 def set_browser_session(browser_obj=None, page_obj=None):
@@ -861,6 +891,7 @@ def create_browser_options(unique_profile=True) -> dict:
         http_prefs = {
             "network.http.http3.enabled": False,
             "network.http.http3.enable_on_any_port": False,
+            "network.proxy.socks_remote_dns": True,
         }
         prefs = dict(opts.get("firefox_user_prefs") or {})
         prefs.update(http_prefs)
@@ -927,6 +958,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
         profile_dir = None
         try:
             opts = create_browser_options(unique_profile=True)
+            opts = _attach_firefox_proxy(opts, log_callback=log_callback)
             profile_dir = getattr(_tls, "profile_dir", None)
             if log_callback and isinstance(opts.get("geoip"), str):
                 log_callback(f"[Debug] geoip 使用预解析出口 IP: {opts['geoip']}")
@@ -1028,6 +1060,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 or "代理不可用或过慢" in msg
                 or "出口IP命中黑名单" in msg
             ):
+                _stop_proxy_relay()
                 break
             # EPIPE / 驱动管道断开：稍等再起一个新 Node，不要立刻放弃
             if _is_driver_pipe_error(exc) and attempt < attempt_limit:
@@ -1041,8 +1074,10 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
             except Exception:
                 pass
             set_browser_session(None, None)
+            _stop_proxy_relay()
             _cleanup_profile_dir(profile_dir)
             time.sleep(min(1.5 * attempt, 4))
+    _stop_proxy_relay()
     raise Exception(f"浏览器启动失败，已尝试{attempts_made}次: {last_exc}")
 
 
@@ -1053,12 +1088,14 @@ def stop_browser(force=False):
     profile_dir = getattr(_tls, "profile_dir", None)
     set_browser_session(None, None)
     if current is None:
+        _stop_proxy_relay()
         _cleanup_profile_dir(profile_dir)
         return
     try:
         current.quit(del_data=True)
     except BaseException:
         pass
+    _stop_proxy_relay()
     _cleanup_profile_dir(profile_dir)
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import ipaddress
+import json
 import os
 import shutil
 import tempfile
@@ -571,32 +572,66 @@ def cleanup_stale_profiles(log_callback=None) -> int:
 
 
 def _normalize_ip_candidate(value: object) -> str:
-    text = str(value or "").strip().split()[0] if str(value or "").strip() else ""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("{") or text.startswith("["):
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            text = str(data.get("ip") or data.get("query") or "").strip()
+    else:
+        picked = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.lower().startswith("ip="):
+                picked = line.split("=", 1)[1].strip()
+                break
+        text = picked or text.split()[0]
     try:
         return str(ipaddress.ip_address(text))
     except ValueError:
         return ""
 
 
-def _resolve_proxy_exit_ip(proxy_str: str, timeout: float = 8.0, log_callback=None) -> str:
+def _socks_family_blocked(exc: object) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "(4)" in msg
+        or "host unreachable" in msg
+        or "network unreachable" in msg
+        or "curl: (97)" in msg
+        or "cannot complete socks5" in msg
+    )
+
+
+def _resolve_proxy_exit_ip(proxy_str: str, timeout: float = 15.0, log_callback=None) -> str:
     """经代理探测出口公网 IP（比 Camoufox 内置 public_ip 更耐住宅延迟）。
 
     Camoufox geoip=True 时会自己请求 ipecho/ipify，timeout 仅 5s，
     住宅 sticky 稍慢就 Failed to get IP → 浏览器启动失败。
     这里加长超时、多源探测，成功后把 IP 字符串传给 geoip=，跳过库内探测。
+    IPv6-only 粘性出口访问 IPv4 探测域会 SOCKS 04 / curl 97，需再试 IPv6 端点。
     """
     import warnings
 
     proxy_str = (proxy_str or "").strip()
     if not proxy_str:
         raise RuntimeError("代理为空，无法探测出口 IP")
-    urls = (
+    ipv4_urls = (
+        "https://ipinfo.io/json",
+        "https://1.1.1.1/cdn-cgi/trace",
         "https://api.ipify.org",
-        "https://checkip.amazonaws.com",
-        "https://icanhazip.com",
+    )
+    ipv6_urls = (
+        "https://v6.ipinfo.io/json",
+        "https://[2606:4700:4700::1111]/cdn-cgi/trace",
+        "https://api64.ipify.org",
     )
     last_exc = None
-    budget = max(2.0, min(float(timeout), 20.0))
+    budget = max(2.0, min(float(timeout), 25.0))
     deadline = time.monotonic() + budget
     clients = []
 
@@ -643,34 +678,41 @@ def _resolve_proxy_exit_ip(proxy_str: str, timeout: float = 8.0, log_callback=No
         add_requests_client()
         add_curl_client()
 
+    families = (("v4", ipv4_urls), ("v6", ipv6_urls))
     for client_name, request_get in clients:
-        hard_fails = 0
-        for url in urls:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            per_try = max(1.0, min(4.0, remaining))
-            try:
-                resp = request_get(url, per_try)
-                resp.raise_for_status()
-                ip = _normalize_ip_candidate(getattr(resp, "text", ""))
-                if ip:
+        for family, urls in families:
+            family_blocked = False
+            for url in urls:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                per_try = max(1.5, min(6.0, remaining))
+                host = url.split("/")[2]
+                try:
+                    resp = request_get(url, per_try)
+                    resp.raise_for_status()
+                    ip = _normalize_ip_candidate(getattr(resp, "text", ""))
+                    if ip:
+                        if log_callback:
+                            log_callback(
+                                f"[*] 代理出口 IP: {ip} ({client_name}/{family}/{host})"
+                            )
+                        return ip
+                    last_exc = RuntimeError("出口探测返回了非 IP 内容")
+                except Exception as exc:
+                    last_exc = exc
                     if log_callback:
                         log_callback(
-                            f"[*] 代理出口 IP: {ip} ({client_name}/{url.split('/')[2]})"
+                            f"[Debug] 出口 IP 探测失败 {family}/{host}: "
+                            f"{redact_log_line(str(exc))}"
                         )
-                    return ip
-                last_exc = RuntimeError("出口探测返回了非 IP 内容")
-            except Exception as exc:
-                last_exc = exc
-                hard_fails += 1
-                if log_callback:
-                    log_callback(
-                        f"[Debug] 出口 IP 探测失败 {url.split('/')[2]}: "
-                        f"{redact_log_line(str(exc))}"
-                    )
-                if hard_fails >= 2:
-                    break
+                    if _socks_family_blocked(exc):
+                        family_blocked = True
+                        break
+            if time.monotonic() >= deadline:
+                break
+            if family_blocked:
+                continue
         if time.monotonic() >= deadline:
             break
     raise RuntimeError(
@@ -816,7 +858,7 @@ def create_browser_options(unique_profile=True) -> dict:
         network_proxy = meter_proxy_url(proxy)
         opts["proxy"] = _build_camoufox_proxy(network_proxy)
         try:
-            exit_ip = _resolve_proxy_exit_ip(network_proxy, timeout=8.0)
+            exit_ip = _resolve_proxy_exit_ip(network_proxy, timeout=15.0)
             blocked, meta = is_blocked_exit_ip(exit_ip)
             if blocked:
                 set_exit_context(proxy=proxy, exit_ip=exit_ip)

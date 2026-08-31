@@ -37,6 +37,17 @@ def test_proxy_ip_validation_is_strict():
     assert browser_session._normalize_ip_candidate("2001:db8::1") == "2001:db8::1"
     assert browser_session._normalize_ip_candidate("999.999.999.999") == ""
     assert browser_session._normalize_ip_candidate("not-an-ip") == ""
+    assert (
+        browser_session._normalize_ip_candidate('{"ip":"203.0.113.9","city":"x"}')
+        == "203.0.113.9"
+    )
+    assert (
+        browser_session._normalize_ip_candidate("fl=123\nip=2001:db8::2\nts=1\n")
+        == "2001:db8::2"
+    )
+    assert browser_session._socks_family_blocked(
+        "curl: (97) cannot complete SOCKS5 connection to checkip.amazonaws.com. (4)"
+    )
 
 
 def test_account_gap_sleep_is_cancelable():

@@ -61,6 +61,7 @@ from secure_files import (
 )
 from webui.proxy_store import (
     IP_FRESH_SECONDS as _PROXY_IP_FRESH_SECONDS,
+    STICKY_PROBE_ACCOUNT as _STICKY_PROBE_ACCOUNT,
     expand_proxy_url as _expand_proxy_url,
     is_sticky_template as _is_sticky_template,
     mark_proxy_used as _mark_managed_proxy_used,
@@ -660,6 +661,35 @@ def reserve_signup_submit_slot(gap: float | None = None) -> float:
         slot = now if _next_submit_at <= now else _next_submit_at
         _next_submit_at = slot + wait_gap
         return max(0.0, slot - now)
+
+
+def probe_ready_proxy_url(url: str = "") -> str:
+    """Expand sticky templates with the probe identity for connectivity checks."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if _is_sticky_template(raw):
+        return _expand_proxy_url(
+            raw,
+            email=_STICKY_PROBE_ACCOUNT,
+            account=_STICKY_PROBE_ACCOUNT,
+            account_id=_STICKY_PROBE_ACCOUNT,
+        )
+    return raw
+
+
+def startup_check_proxy() -> str:
+    """Proxy used for batch precheck. Never fall back to a dead config.proxy
+    when the panel pool is configured but currently empty/unhealthy.
+    """
+    pool = load_proxy_pool()
+    if _proxy_pool_source == "managed-empty":
+        raise RuntimeError(
+            "面板代理池没有健康且启用的代理，请先在代理池点「检测全部」后再启动"
+        )
+    if pool:
+        return probe_ready_proxy_url(pool[0])
+    return str(config.get("proxy") or "").strip()
 
 
 def load_proxy_pool(path: str = "") -> list:
@@ -3768,7 +3798,13 @@ class GrokRegisterGUI:
 
         def _job():
             try:
-                results = _conn.run_connectivity_checks(config, http_get, http_post)
+                check_cfg = dict(config)
+                try:
+                    check_cfg["proxy"] = startup_check_proxy()
+                except RuntimeError as proxy_exc:
+                    self.ui_queue.put((self._on_check_done, (str(proxy_exc), False)))
+                    return
+                results = _conn.run_connectivity_checks(check_cfg, http_get, http_post)
                 text = _conn.format_check_results(results)
                 all_ok = all(ok for _, ok, _ in results)
                 self.ui_queue.put((self._on_check_done, (text, all_ok)))
@@ -3981,7 +4017,14 @@ class GrokRegisterGUI:
         self._accounts_lock = threading.Lock()
         # 启动前快速连通性检查（失败仍可继续，只警告）
         try:
-            checks = _conn.run_connectivity_checks(config, http_get, http_post)
+            check_cfg = dict(config)
+            try:
+                check_cfg["proxy"] = startup_check_proxy()
+            except RuntimeError as proxy_exc:
+                self.log(f"[!] {proxy_exc}")
+                self._set_running_ui(False)
+                return
+            checks = _conn.run_connectivity_checks(check_cfg, http_get, http_post)
             for name, ok, detail in checks:
                 self.log(
                     f"[检查] [{'OK' if ok else 'FAIL'}] {name}: "
@@ -4356,8 +4399,11 @@ def run_registration_cli(count):
         pass
     try:
         startup_config = dict(config)
-        if pool:
-            startup_config["proxy"] = pool[0]
+        try:
+            startup_config["proxy"] = startup_check_proxy()
+        except RuntimeError as proxy_exc:
+            cli_log(f"[!] {proxy_exc}")
+            raise _conn.XaiSignupPrecheckFailed(str(proxy_exc)) from proxy_exc
         startup_checks = _conn.run_connectivity_checks(startup_config, http_get, http_post)
         for name, ok, detail in startup_checks:
             cli_log(

@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Stop using leftover `config.proxy` (often `127.0.0.1:7890`) for the blocking xAI precheck when the panel proxy pool is configured but currently empty; require a healthy pool node instead, and expand sticky `{account}` templates for the probe check.
 - Stop assigning `scripts/playwright-node` (a POSIX shell wrapper) to `PLAYWRIGHT_NODEJS_PATH` on Windows, which previously made Camoufox fail to spawn.
 - Keep POSIX `GROK_PLAYWRIGHT_NODE` on a real node binary so the wrapper cannot `exec` itself. Quote Windows `NODE_OPTIONS --require` paths that contain spaces.
 

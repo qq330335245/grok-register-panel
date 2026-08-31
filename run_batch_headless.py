@@ -126,8 +126,11 @@ def _run_child(count: int, workers: int) -> int:
     )
     app.load_config()
     app._wire_runtime_modules()
+    pool = app.load_proxy_pool()
+    shown_proxy = pool[0] if pool else app.config.get("proxy")
     print(
-        f"[batch] count={count} workers={workers} proxy={_redact_proxy(app.config.get('proxy'))}",
+        f"[batch] count={count} workers={workers} "
+        f"proxy={_redact_proxy(shown_proxy)} pool={len(pool)}/{app._proxy_pool_source}",
         flush=True,
     )
     try:

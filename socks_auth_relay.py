@@ -36,6 +36,7 @@ class SocksAuthRelay:
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.last_error: Optional[BaseException] = None
 
     @property
     def local_server(self) -> str:
@@ -111,7 +112,11 @@ class SocksAuthRelay:
                 addr = socket.inet_ntoa(_recv_exact(conn, 4))
             elif atyp == 0x03:
                 length = _recv_exact(conn, 1)[0]
-                addr = _recv_exact(conn, length).decode("idna", "surrogateescape")
+                raw_host = _recv_exact(conn, length)
+                try:
+                    addr = raw_host.decode("idna")
+                except Exception:
+                    addr = raw_host.decode("utf-8", "surrogateescape")
             elif atyp == 0x04:
                 addr = socket.inet_ntop(socket.AF_INET6, _recv_exact(conn, 16))
             else:
@@ -131,7 +136,8 @@ class SocksAuthRelay:
             remote.connect((addr, port))
             conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             _pipe(conn, remote)
-        except Exception:
+        except Exception as exc:
+            self.last_error = exc
             try:
                 conn.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
             except Exception:

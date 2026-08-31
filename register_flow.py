@@ -681,12 +681,44 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         except Exception:
             page_obj = browser_obj.new_tab()
         set_browser_session(browser_obj, page_obj)
-        page_obj.get(SIGNUP_URL)
-        page_obj.wait.doc_loaded()
-        # 确认真的进了注册域；about:blank / 错页直接失败
-        current = str(getattr(page_obj, "url", "") or "")
-        if "accounts.x.ai" not in current and "x.ai" not in current:
-            raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
+        last_nav = None
+        for attempt in range(1, 4):
+            try:
+                page_obj.get(SIGNUP_URL, wait_until="domcontentloaded", timeout=60_000)
+                try:
+                    page_obj.wait.doc_loaded()
+                except Exception:
+                    pass
+                current = str(getattr(page_obj, "url", "") or "")
+                if "accounts.x.ai" not in current and "x.ai" not in current:
+                    raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
+                last_nav = None
+                break
+            except Exception as nav_exc:
+                last_nav = nav_exc
+                msg = str(nav_exc)
+                retryable = any(
+                    marker in msg
+                    for marker in (
+                        "NS_ERROR_NET_RESET",
+                        "NS_ERROR_NET_INTERRUPT",
+                        "NS_ERROR_CONNECTION_REFUSED",
+                        "ERR_CONNECTION_RESET",
+                        "ERR_HTTP2",
+                        "Timeout",
+                        "timeout",
+                    )
+                )
+                if attempt < 3 and retryable:
+                    if log_callback:
+                        log_callback(
+                            f"[!] 打开注册页网络中断，同页重试 {attempt}/3: {nav_exc}"
+                        )
+                    sleep_with_cancel(1.2 * attempt, cancel_callback)
+                    continue
+                raise
+        if last_nav is not None:
+            raise last_nav
 
     try:
         _navigate_signup()

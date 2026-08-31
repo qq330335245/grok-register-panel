@@ -360,6 +360,8 @@ class CamoufoxPage:
 
     # ── 导航 ──
     def get(self, url: str, **kw):
+        kw.setdefault("wait_until", "domcontentloaded")
+        kw.setdefault("timeout", 60_000)
         self._page.goto(url, **kw)
 
     def back(self):

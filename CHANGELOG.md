@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Disable Firefox HTTP/3 through SOCKS and retry `accounts.x.ai` navigation on `NS_ERROR_NET_RESET`, which IPv6 sticky exits commonly hit on Cloudflare.
 - After IPv4 SOCKS host-unreachable (code 4 / curl 97) on sticky residential exits, retry IPv6 IP probes (`v6.ipinfo.io`, Cloudflare IPv6 trace) instead of failing browser start.
 - Stop using leftover `config.proxy` (often `127.0.0.1:7890`) for the blocking xAI precheck when the panel proxy pool is configured but currently empty; require a healthy pool node instead, and expand sticky `{account}` templates for the probe check.
 - Stop assigning `scripts/playwright-node` (a POSIX shell wrapper) to `PLAYWRIGHT_NODEJS_PATH` on Windows, which previously made Camoufox fail to spawn.

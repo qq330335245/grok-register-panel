@@ -857,6 +857,14 @@ def create_browser_options(unique_profile=True) -> dict:
     if proxy:
         network_proxy = meter_proxy_url(proxy)
         opts["proxy"] = _build_camoufox_proxy(network_proxy)
+        # HTTP/3 over SOCKS (especially IPv6 sticky) often NS_ERROR_NET_RESET on CF.
+        http_prefs = {
+            "network.http.http3.enabled": False,
+            "network.http.http3.enable_on_any_port": False,
+        }
+        prefs = dict(opts.get("firefox_user_prefs") or {})
+        prefs.update(http_prefs)
+        opts["firefox_user_prefs"] = prefs
         try:
             exit_ip = _resolve_proxy_exit_ip(network_proxy, timeout=15.0)
             blocked, meta = is_blocked_exit_ip(exit_ip)

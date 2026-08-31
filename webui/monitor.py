@@ -12,7 +12,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -76,6 +76,7 @@ try:
         stop_sso_state_scan,
     )
     from webui.security_utils import (
+        check_token,
         check_token_optional_read,
         expected_token,
         mask_email,
@@ -127,6 +128,7 @@ except ImportError:  # running as script from webui/
         stop_sso_state_scan,
     )
     from security_utils import (  # type: ignore
+        check_token,
         check_token_optional_read,
         expected_token,
         mask_email,
@@ -2051,7 +2053,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="control-grid">
       <div class="field field-token">
         <label for="monitor-token">访问令牌</label>
-        <input id="monitor-token" type="password" autocomplete="off" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshBfs()" onblur="getToken()"/>
+        <input id="monitor-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="MONITOR_TOKEN" onchange="getToken(); refresh(); refreshRecovery(); refreshProxies(); refreshEmailProvider(); refreshEmailDomains(); refreshSsoState(); refreshBfs()" onblur="getToken()"/>
       </div>
       <div class="field field-mode">
         <label for="mode">运行模式</label>
@@ -2816,27 +2818,34 @@ function setMsg(id, text, cls) {
   el.className = "msg" + (cls ? " " + cls : "");
 }
 function getToken() {
+  const injected = String(window.MONITOR_TOKEN || "").trim();
+  if (injected) {
+    try { localStorage.setItem("MONITOR_TOKEN", injected); } catch (e) {}
+    return injected;
+  }
   const el = document.getElementById("monitor-token");
   const fromInput = el ? (el.value || "").trim() : "";
-  const injected = String(window.MONITOR_TOKEN || "").trim();
   let stored = "";
   try { stored = localStorage.getItem("MONITOR_TOKEN") || ""; } catch (e) {}
-  const tok = (fromInput || injected || stored || "").trim();
+  const tok = (fromInput || stored || "").trim();
   if (fromInput) try { localStorage.setItem("MONITOR_TOKEN", fromInput); } catch (e) {}
-  else if (injected) try { localStorage.setItem("MONITOR_TOKEN", injected); } catch (e) {}
   return tok;
 }
 function loadTokenField() {
   const el = document.getElementById("monitor-token");
   if (!el) return;
   const injected = String(window.MONITOR_TOKEN || "").trim();
-  let stored = "";
-  try { stored = localStorage.getItem("MONITOR_TOKEN") || ""; } catch (e) {}
-  if (!el.value) el.value = injected || stored || "";
+  const wrap = el.closest(".field-token");
   if (injected) {
+    el.value = injected;
     el.placeholder = "本机已自动带上令牌";
-    const label = document.querySelector("label[for=monitor-token]");
-    if (label) label.textContent = "访问令牌（本机已自动带上）" ;
+    if (wrap) wrap.hidden = true;
+    try { localStorage.setItem("MONITOR_TOKEN", injected); } catch (e) {}
+    return;
+  }
+  if (wrap) wrap.hidden = false;
+  if (!el.value) {
+    try { el.value = localStorage.getItem("MONITOR_TOKEN") || ""; } catch (e) {}
   }
 }
 async function api(path, opts) {
@@ -3970,6 +3979,15 @@ setInterval(() => {
 """
 
 MONITOR_TOKEN_BOOTSTRAP = "/*MONITOR_TOKEN_BOOTSTRAP*/"
+MONITOR_COOKIE = "monitor_token"
+
+
+def _cookie_monitor_token(header: object) -> str:
+    for part in str(header or "").split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name == MONITOR_COOKIE:
+            return unquote(value.strip())
+    return ""
 
 
 def _is_loopback_addr(host: object) -> bool:
@@ -4007,7 +4025,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, extra_headers=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
@@ -4034,15 +4052,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", allow)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        for key, value in extra_headers or ():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
     def _auth_header(self) -> str:
-        return (
+        header = (
             self.headers.get("Authorization")
             or self.headers.get("X-Monitor-Token")
             or ""
         )
+        if check_token(header):
+            return header
+        cookie = _cookie_monitor_token(self.headers.get("Cookie"))
+        if cookie:
+            return cookie
+        return header
 
     def _require_write(self) -> bool:
         if check_token_optional_read(self._auth_header(), write=True):
@@ -4084,11 +4110,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
-            page = render_index_html(
-                token=expected_token(),
-                loopback=_is_loopback_addr(self.client_address[0] if self.client_address else ""),
-            )
-            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
+            loopback = _is_loopback_addr(self.client_address[0] if self.client_address else "")
+            token = expected_token()
+            page = render_index_html(token=token, loopback=loopback)
+            extra = []
+            if loopback and token:
+                extra.append((
+                    "Set-Cookie",
+                    f"{MONITOR_COOKIE}={quote(token, safe='')}; Path=/; SameSite=Strict",
+                ))
+            self._send(200, page.encode("utf-8"), "text/html; charset=utf-8", extra_headers=extra)
             return
         if u.path in FONT_ASSETS:
             path = FONT_ASSETS[u.path]

@@ -28,6 +28,7 @@ PROVIDER_LABELS = {
     "moemail": "MoeMail",
     "outlook_rt": "Outlook RT 库存",
     "inbucket": "Inbucket",
+    "icloud": "iCloud Hide My Email",
 }
 SUPPORTED_PROVIDERS = tuple(PROVIDER_LABELS)
 
@@ -204,6 +205,98 @@ FIELD_DEFINITIONS = {
             {"value": "1-3", "label": "随机 1-3 级子域"},
         ],
     },
+    "icloud_cookies": {
+        "label": "iCloud Cookies",
+        "type": "textarea",
+        "secret": True,
+        "wide": True,
+        "max_length": 65536,
+        "placeholder": "从 icloud.com 复制网页会话 Cookie",
+    },
+    "icloud_alias_label": {
+        "label": "别名标签",
+        "type": "text",
+        "default": "grok",
+    },
+    "icloud_temp_mail_base": {
+        "label": "CF Temp-Mail API Base",
+        "type": "url",
+        "placeholder": "https://mail.example.com",
+    },
+    "icloud_temp_mail_password": {
+        "label": "Temp-Mail Admin 密码",
+        "type": "password",
+        "secret": True,
+    },
+    "icloud_temp_mail_target": {
+        "label": "HME 转发目标邮箱",
+        "type": "email",
+        "placeholder": "inbox@example.com",
+    },
+    "icloud_temp_mail_custom_auth": {
+        "label": "自定义鉴权（可选）",
+        "type": "password",
+        "secret": True,
+        "placeholder": "留空则使用 Admin 密码",
+    },
+    "icloud_inventory_file": {
+        "label": "库存文件",
+        "type": "text",
+        "default": "icloud_alias_inventory.db",
+    },
+    "icloud_platform_tag": {
+        "label": "平台标记",
+        "type": "text",
+        "default": "grok",
+    },
+    "icloud_reuse_aliases": {
+        "label": "优先复用库存别名",
+        "type": "bool",
+        "default": True,
+    },
+    "icloud_create_when_exhausted": {
+        "label": "库存耗尽时即时创建",
+        "type": "bool",
+        "default": True,
+    },
+    "icloud_cloud_mark": {
+        "label": "注册后写入 HME 标记",
+        "type": "bool",
+        "default": True,
+    },
+    "icloud_auto_create_enabled": {
+        "label": "启用定时自动创建",
+        "type": "bool",
+        "default": False,
+    },
+    "icloud_auto_create_interval_minutes": {
+        "label": "创建间隔（分钟）",
+        "type": "int",
+        "default": 60,
+        "min": 1,
+        "max": 1440,
+    },
+    "icloud_auto_create_batch_size": {
+        "label": "每次创建数量",
+        "type": "int",
+        "default": 1,
+        "min": 1,
+        "max": 20,
+    },
+    "icloud_low_watermark": {
+        "label": "低水位",
+        "type": "int",
+        "default": 5,
+        "min": 0,
+        "max": 1000,
+    },
+    "icloud_high_watermark": {
+        "label": "高水位",
+        "type": "int",
+        "default": 20,
+        "min": 1,
+        "max": 1000,
+    },
 }
 
 PROVIDER_FIELDS = {
@@ -240,6 +333,24 @@ PROVIDER_FIELDS = {
         "outlook_rt_client_id",
     ),
     "inbucket": ("inbucket_api_base", "inbucket_domain", "inbucket_random_levels"),
+    "icloud": (
+        "icloud_cookies",
+        "icloud_alias_label",
+        "icloud_temp_mail_base",
+        "icloud_temp_mail_password",
+        "icloud_temp_mail_target",
+        "icloud_temp_mail_custom_auth",
+        "icloud_inventory_file",
+        "icloud_platform_tag",
+        "icloud_reuse_aliases",
+        "icloud_create_when_exhausted",
+        "icloud_cloud_mark",
+        "icloud_auto_create_enabled",
+        "icloud_auto_create_interval_minutes",
+        "icloud_auto_create_batch_size",
+        "icloud_low_watermark",
+        "icloud_high_watermark",
+    ),
 }
 
 SECRET_FIELDS = {
@@ -280,12 +391,13 @@ def _read_unlocked() -> tuple[dict, str]:
         return {}, redact_log_line(str(exc))[:240]
 
 
-def _string(value: object, *, strip: bool = True) -> str:
+def _string(value: object, *, strip: bool = True, allow_newlines: bool = False, max_length: int = MAX_VALUE_LENGTH) -> str:
     text = str(value or "")
-    if any(ord(char) < 32 and char not in "\t" for char in text):
+    allowed = "\t\n\r" if allow_newlines else "\t"
+    if any(ord(char) < 32 and char not in allowed for char in text):
         raise EmailProviderConfigError("配置值包含非法控制字符")
     text = text.strip() if strip else text
-    if len(text) > MAX_VALUE_LENGTH:
+    if len(text) > max_length:
         raise EmailProviderConfigError("配置值过长")
     return text
 
@@ -324,6 +436,33 @@ def _normalize_domains(value: object) -> str:
 def _normalize_value(name: str, value: object):
     definition = FIELD_DEFINITIONS[name]
     field_type = definition.get("type")
+    if field_type == "textarea":
+        return _string(
+            value,
+            allow_newlines=True,
+            max_length=int(definition.get("max_length") or 65536),
+        )
+    if field_type == "bool":
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off", ""}:
+            return bool(definition.get("default", False))
+        raise EmailProviderConfigError(f"{definition['label']}无效")
+    if field_type == "int":
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise EmailProviderConfigError(f"{definition['label']}必须是整数") from exc
+        minimum = int(definition.get("min", 0))
+        maximum = int(definition.get("max", 10**9))
+        if number < minimum or number > maximum:
+            raise EmailProviderConfigError(
+                f"{definition['label']}必须在 {minimum}-{maximum} 之间"
+            )
+        return number
     if field_type == "url":
         normalized = _normalize_url(value)
         return normalized or definition.get("default", "")
@@ -416,6 +555,13 @@ def _is_configured(provider: str, values: dict) -> bool:
         return bool(inventory and Path(inventory).expanduser().is_file())
     if provider == "inbucket":
         return bool(values.get("inbucket_api_base") and values.get("inbucket_domain"))
+    if provider == "icloud":
+        return bool(
+            values.get("icloud_cookies")
+            and values.get("icloud_temp_mail_base")
+            and values.get("icloud_temp_mail_password")
+            and values.get("icloud_temp_mail_target")
+        )
     return False
 
 

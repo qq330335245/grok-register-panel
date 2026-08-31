@@ -56,6 +56,7 @@ def test_provider_schema_and_defaults():
             "moemail",
             "outlook_rt",
             "inbucket",
+            "icloud",
         }
         assert providers["outlook_rt"]["configured"] is False
         assert any(
@@ -313,6 +314,45 @@ def test_inbucket_requires_base_and_domain():
         )
 
 
+def test_icloud_schema_and_bool_normalization():
+    with IsolatedConfig() as config_path:
+        state = email_provider_store.read_email_provider_config()
+        providers = {item["id"]: item for item in state["providers"]}
+        assert "icloud" in providers
+        names = {field["name"] for field in providers["icloud"]["fields"]}
+        assert "icloud_cookies" in names
+        assert "icloud_temp_mail_target" in names
+        assert providers["icloud"]["configured"] is False
+        saved = email_provider_store.save_email_provider_config(
+            "icloud",
+            {
+                "icloud_cookies": "X-APPLE-WEBAUTH-USER=1; X-APPLE-WEBAUTH-TOKEN=2",
+                "icloud_temp_mail_base": "https://mail.example.com/",
+                "icloud_temp_mail_password": "admin-pass",
+                "icloud_temp_mail_target": "inbox@example.com",
+                "icloud_reuse_aliases": "true",
+                "icloud_create_when_exhausted": False,
+                "icloud_auto_create_interval_minutes": 30,
+                "icloud_auto_create_batch_size": 2,
+            },
+        )
+        assert saved["provider"] == "icloud"
+        assert saved["configured"] is True
+        assert saved["values"]["icloud_cookies"] == ""
+        assert saved["secret_configured"]["icloud_cookies"] is True
+        assert saved["values"]["icloud_temp_mail_base"] == "https://mail.example.com"
+        assert saved["values"]["icloud_reuse_aliases"] is True
+        assert saved["values"]["icloud_create_when_exhausted"] is False
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        assert raw["icloud_cookies"].startswith("X-APPLE-WEBAUTH-USER=")
+        assert raw["icloud_auto_create_interval_minutes"] == 30
+        assert_config_error(
+            lambda: email_provider_store.save_email_provider_config(
+                "icloud", {"icloud_auto_create_batch_size": 99}
+            )
+        )
+
+
 if __name__ == "__main__":
     test_provider_schema_and_defaults()
     test_secret_masking_preservation_clear_and_private_file()
@@ -322,4 +362,5 @@ if __name__ == "__main__":
     test_cloudflare_direct_create_does_not_probe_admin_domains()
     test_cloudflare_admin_create_does_not_probe_mailbox_domains()
     test_inbucket_requires_base_and_domain()
+    test_icloud_schema_and_bool_normalization()
     print("OK email provider store")

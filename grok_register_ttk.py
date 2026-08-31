@@ -38,6 +38,7 @@ from email_providers import duckmail as duckmail_provider
 from email_providers import inbucket as inbucket_provider
 from email_providers import mailnest as mailnest_provider
 from email_providers import moemail as moemail_provider
+from email_providers import icloud as icloud_provider
 from email_providers import outlook_rt as outlook_rt_provider
 from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
@@ -245,6 +246,35 @@ DEFAULT_CONFIG = {
     "outlook_rt_inventory": "",
     "outlook_rt_used_path": "",
     "outlook_rt_client_id": outlook_rt_provider.DEFAULT_CLIENT_ID,
+    # iCloud Hide My Email + CF Temp-Mail 转发收信
+    "icloud_cookies": "",
+    "icloud_alias_label": "grok",
+    "icloud_temp_mail_base": "",
+    "icloud_temp_mail_password": "",
+    "icloud_temp_mail_target": "",
+    "icloud_temp_mail_custom_auth": "",
+    "icloud_used_file": "icloud_used_emails.json",
+    "icloud_reuse_aliases": True,
+    "icloud_create_when_exhausted": True,
+    "icloud_platform_tag": "grok",
+    "icloud_cloud_mark": True,
+    "icloud_use_local_used": False,
+    "icloud_inventory_file": "icloud_alias_inventory.db",
+    "icloud_coordination_mode": "local_fast",
+    "icloud_lease_ttl_sec": 900,
+    "icloud_sync_interval_sec": 300,
+    "icloud_async_mark": True,
+    "icloud_background_replenish": True,
+    "icloud_low_watermark": 5,
+    "icloud_high_watermark": 20,
+    "icloud_replenish_interval_sec": 30,
+    "icloud_create_per_cycle": 3,
+    "icloud_auto_create_enabled": False,
+    "icloud_auto_create_interval_minutes": 60,
+    "icloud_auto_create_batch_size": 1,
+    "icloud_fail_cooldown_sec": 1800,
+    "icloud_fail_cooldown_max_sec": 86400,
+    "icloud_fail_cooldown_threshold": 3,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
 }
@@ -811,6 +841,7 @@ def _url_needs_direct(url: str) -> bool:
         config.get("moemail_api_base"),
         config.get("duckmail_api_base"),
         config.get("inbucket_api_base"),
+        config.get("icloud_temp_mail_base"),
     )
     for value in configured_bases:
         base = str(value or "").strip().lower().rstrip("/")
@@ -1859,6 +1890,161 @@ def _record_email_domain_rejected(email: str, message: str = "") -> str:
     return f"域名池拒绝计数 {count}/{threshold}"
 
 
+ICLOUD_PROVIDER_ALIASES = ("icloud", "icloud_hme", "hide_my_email", "hme")
+_icloud_tls = threading.local()
+
+
+def is_icloud_provider(provider=None) -> bool:
+    return str(provider or get_email_provider() or "").strip().lower() in ICLOUD_PROVIDER_ALIASES
+
+
+def set_active_icloud_lease(lease_dict=None):
+    _icloud_tls.lease = lease_dict
+
+
+def get_active_icloud_lease():
+    return getattr(_icloud_tls, "lease", None) or {}
+
+
+def _icloud_log(log_callback, message: str) -> None:
+    if log_callback:
+        try:
+            log_callback(message)
+            return
+        except Exception:
+            pass
+    try:
+        cli_log(message)
+    except Exception:
+        print(message, flush=True)
+
+
+def release_active_icloud_lease(reason="", cooldown=True, log_callback=None):
+    if not is_icloud_provider():
+        return
+    active = get_active_icloud_lease()
+    if not active:
+        return
+    try:
+        icloud_provider.release_registration(
+            email=str(active.get("email") or ""),
+            lease_id=str(active.get("lease_id") or ""),
+            cookies_raw=str(config.get("icloud_cookies") or ""),
+            platform=str(config.get("icloud_platform_tag") or "grok"),
+            cloud_mark=bool(config.get("icloud_cloud_mark", True)),
+            inventory_path=str(config.get("icloud_inventory_file") or "icloud_alias_inventory.db"),
+            coordination_mode=str(config.get("icloud_coordination_mode") or "local_fast"),
+            recycle=True,
+            cooldown=cooldown,
+            cooldown_sec=float(config.get("icloud_fail_cooldown_sec") or 1800),
+            reason=reason,
+            log_callback=lambda m: _icloud_log(log_callback, m),
+            label=str(config.get("icloud_alias_label") or "grok"),
+        )
+    except Exception as exc:
+        _icloud_log(log_callback, f"[!] iCloud 冷却释放失败: {exc}")
+    finally:
+        set_active_icloud_lease(None)
+
+
+def commit_active_icloud_as_registered(email="", log_callback=None):
+    if not is_icloud_provider():
+        return
+    active = get_active_icloud_lease() or {}
+    addr = str(email or active.get("email") or "").strip()
+    if not addr and not active.get("lease_id"):
+        return
+    try:
+        icloud_provider.record_registered(
+            addr,
+            str(config.get("icloud_used_file") or "icloud_used_emails.json"),
+            cookies_raw=str(config.get("icloud_cookies") or ""),
+            anonymous_id=str(active.get("anonymous_id") or ""),
+            platform=str(config.get("icloud_platform_tag") or "grok"),
+            cloud_mark=bool(config.get("icloud_cloud_mark", True)),
+            use_local_used=bool(config.get("icloud_use_local_used", False)),
+            lease_id=str(active.get("lease_id") or ""),
+            inventory_path=str(config.get("icloud_inventory_file") or "icloud_alias_inventory.db"),
+            coordination_mode=str(config.get("icloud_coordination_mode") or "local_fast"),
+            log_callback=lambda m: _icloud_log(log_callback, m),
+        )
+    except Exception as exc:
+        _icloud_log(log_callback, f"[!] iCloud 注册提交失败: {exc}")
+    finally:
+        set_active_icloud_lease(None)
+
+
+def icloud_take_mailbox():
+    cookies = str(config.get("icloud_cookies") or "").strip()
+    if not cookies:
+        raise Exception("iCloud 需配置 icloud_cookies（Apple 网页会话 Cookie）")
+    if not str(config.get("icloud_temp_mail_base") or "").strip():
+        raise Exception("iCloud 需配置 icloud_temp_mail_base（CF Temp-Mail API Base）")
+    if not str(config.get("icloud_temp_mail_password") or "").strip():
+        raise Exception("iCloud 需配置 icloud_temp_mail_password（Admin 密码）")
+    if not str(config.get("icloud_temp_mail_target") or "").strip():
+        raise Exception("iCloud 需配置 icloud_temp_mail_target（HME 转发目标邮箱）")
+
+    def _log(msg: str) -> None:
+        _icloud_log(None, msg)
+
+    lease = icloud_provider.acquire_lease(
+        cookies,
+        inventory_path=str(config.get("icloud_inventory_file") or "icloud_alias_inventory.db"),
+        used_file=str(config.get("icloud_used_file") or "icloud_used_emails.json"),
+        reuse_aliases=bool(config.get("icloud_reuse_aliases", True)),
+        create_when_exhausted=bool(config.get("icloud_create_when_exhausted", True)),
+        label=str(config.get("icloud_alias_label") or "grok"),
+        platform=str(config.get("icloud_platform_tag") or "grok"),
+        cloud_mark=bool(config.get("icloud_cloud_mark", True)),
+        use_local_used=bool(config.get("icloud_use_local_used", False)),
+        coordination_mode=str(config.get("icloud_coordination_mode") or "local_fast"),
+        async_mark=bool(config.get("icloud_async_mark", True)),
+        background_replenish=bool(config.get("icloud_background_replenish", True)),
+        low_watermark=int(config.get("icloud_low_watermark") or 5),
+        high_watermark=int(config.get("icloud_high_watermark") or 20),
+        replenish_interval_sec=float(config.get("icloud_replenish_interval_sec") or 30),
+        create_per_cycle=int(config.get("icloud_create_per_cycle") or 3),
+        fail_cooldown_sec=float(config.get("icloud_fail_cooldown_sec") or 1800),
+        fail_cooldown_max_sec=float(config.get("icloud_fail_cooldown_max_sec") or 86400),
+        fail_cooldown_threshold=int(config.get("icloud_fail_cooldown_threshold") or 3),
+        lease_ttl_sec=float(config.get("icloud_lease_ttl_sec") or 900),
+        sync_interval_sec=float(config.get("icloud_sync_interval_sec") or 300),
+        timeout=25.0,
+        log_callback=_log,
+    )
+    set_active_icloud_lease(lease.to_dict())
+    token = str(lease.anonymous_id or lease.lease_id or lease.email or "_").strip() or "_"
+    return lease.email, token
+
+
+def icloud_get_oai_code(
+    token_key,
+    email,
+    timeout=180,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    _ = token_key, resend_callback
+    return icloud_provider.wait_for_verification_code(
+        email,
+        temp_mail_base=str(config.get("icloud_temp_mail_base") or "").strip(),
+        temp_mail_password=str(config.get("icloud_temp_mail_password") or "").strip(),
+        temp_mail_target=str(config.get("icloud_temp_mail_target") or "").strip(),
+        temp_mail_custom_auth=str(config.get("icloud_temp_mail_custom_auth") or "").strip(),
+        http_get=http_get,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        cookies_raw=str(config.get("icloud_cookies") or ""),
+        inventory_path=str(config.get("icloud_inventory_file") or "icloud_alias_inventory.db"),
+        platform=str(config.get("icloud_platform_tag") or "grok"),
+    )
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
     managed_domain = _managed_domain_for_provider(provider)
@@ -1907,6 +2093,8 @@ def get_email_and_token(api_key=None):
         return inbucket_get_email_and_token(domain=managed_domain)
     if provider == "outlook_rt":
         return outlook_rt_take_mailbox()
+    if is_icloud_provider(provider):
+        return icloud_take_mailbox()
     return duckmail_provider.create_mailbox(
         http_get,
         http_post,
@@ -2055,6 +2243,16 @@ def get_oai_code(
             poll_interval=max(3, int(poll_interval or 4)),
             log_callback=log_callback,
             cancel_callback=cancel_callback,
+        )
+    if is_icloud_provider(provider):
+        return icloud_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
         )
     return duckmail_get_oai_code(
         dev_token,
@@ -2767,6 +2965,7 @@ class GrokRegisterGUI:
                 "cloudmail",
                 "moemail",
                 "outlook_rt",
+                "icloud",
             ],
             width=12,
         )
@@ -3084,6 +3283,108 @@ class GrokRegisterGUI:
             ),
         ]
 
+        self.icloud_cookies_var = tk.StringVar(value=str(config.get("icloud_cookies", "") or ""))
+        self.icloud_temp_mail_base_var = tk.StringVar(value=str(config.get("icloud_temp_mail_base", "") or ""))
+        self.icloud_temp_mail_password_var = tk.StringVar(value=str(config.get("icloud_temp_mail_password", "") or ""))
+        self.icloud_temp_mail_target_var = tk.StringVar(value=str(config.get("icloud_temp_mail_target", "") or ""))
+        self.icloud_temp_mail_custom_auth_var = tk.StringVar(
+            value=str(config.get("icloud_temp_mail_custom_auth", "") or "")
+        )
+        self.icloud_alias_label_var = tk.StringVar(value=str(config.get("icloud_alias_label", "grok") or "grok"))
+        self.icloud_inventory_file_var = tk.StringVar(
+            value=str(config.get("icloud_inventory_file", "icloud_alias_inventory.db") or "icloud_alias_inventory.db")
+        )
+        self.icloud_reuse_aliases_var = tk.BooleanVar(value=bool(config.get("icloud_reuse_aliases", True)))
+        self.icloud_create_when_exhausted_var = tk.BooleanVar(
+            value=bool(config.get("icloud_create_when_exhausted", True))
+        )
+        self.icloud_cloud_mark_var = tk.BooleanVar(value=bool(config.get("icloud_cloud_mark", True)))
+        self._icloud_widgets = [
+            p_label(0, 0, "iCloud Cookies:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.icloud_cookies_var, width=70),
+                0,
+                1,
+                columnspan=3,
+            ),
+            p_label(1, 0, "Temp-Mail Base:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.icloud_temp_mail_base_var, width=34),
+                1,
+                1,
+            ),
+            p_label(1, 2, "Admin 密码:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_temp_mail_password_var,
+                    width=34,
+                    show="*",
+                ),
+                1,
+                3,
+            ),
+            p_label(2, 0, "转发目标:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.icloud_temp_mail_target_var, width=34),
+                2,
+                1,
+            ),
+            p_label(2, 2, "自定义鉴权:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.icloud_temp_mail_custom_auth_var,
+                    width=34,
+                    show="*",
+                ),
+                2,
+                3,
+            ),
+            p_label(3, 0, "别名标签:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.icloud_alias_label_var, width=34),
+                3,
+                1,
+            ),
+            p_label(3, 2, "库存文件:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.icloud_inventory_file_var, width=34),
+                3,
+                3,
+            ),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="优先复用库存别名",
+                    variable=self.icloud_reuse_aliases_var,
+                ),
+                4,
+                1,
+                sticky=tk.W,
+            ),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="库存耗尽时即时创建",
+                    variable=self.icloud_create_when_exhausted_var,
+                ),
+                4,
+                3,
+                sticky=tk.W,
+            ),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="注册后写 HME note 标记",
+                    variable=self.icloud_cloud_mark_var,
+                ),
+                5,
+                1,
+                sticky=tk.W,
+            ),
+        ]
+
         self._provider_widget_groups = {
             "duckmail": self._duckmail_widgets,
             "cloudflare": self._cloudflare_widgets,
@@ -3092,6 +3393,7 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
             "moemail": self._moemail_widgets,
             "outlook_rt": self._outlook_rt_widgets,
+            "icloud": self._icloud_widgets,
         }
 
         add_label(3, 0, "并发数（可选）:")
@@ -3269,6 +3571,7 @@ class GrokRegisterGUI:
             "cloudmail": "CloudMail 配置",
             "moemail": "MoeMail 配置",
             "outlook_rt": "Outlook RT 库存配置",
+            "icloud": "iCloud Hide My Email 配置",
         }
         self.provider_frame.configure(text=titles.get(provider, "邮箱服务商配置"))
         for widgets in self._provider_widget_groups.values():
@@ -3277,6 +3580,22 @@ class GrokRegisterGUI:
         for widget in self._provider_widget_groups.get(provider, self._cloudflare_widgets):
             # grid_remove 后无参 grid() 会恢复原行列
             widget.grid()
+
+    def _apply_icloud_gui_config(self):
+        if not hasattr(self, "icloud_cookies_var"):
+            return
+        config["icloud_cookies"] = self.icloud_cookies_var.get().strip()
+        config["icloud_temp_mail_base"] = self.icloud_temp_mail_base_var.get().strip()
+        config["icloud_temp_mail_password"] = self.icloud_temp_mail_password_var.get().strip()
+        config["icloud_temp_mail_target"] = self.icloud_temp_mail_target_var.get().strip()
+        config["icloud_temp_mail_custom_auth"] = self.icloud_temp_mail_custom_auth_var.get().strip()
+        config["icloud_alias_label"] = self.icloud_alias_label_var.get().strip() or "grok"
+        config["icloud_inventory_file"] = (
+            self.icloud_inventory_file_var.get().strip() or "icloud_alias_inventory.db"
+        )
+        config["icloud_reuse_aliases"] = bool(self.icloud_reuse_aliases_var.get())
+        config["icloud_create_when_exhausted"] = bool(self.icloud_create_when_exhausted_var.get())
+        config["icloud_cloud_mark"] = bool(self.icloud_cloud_mark_var.get())
 
     def _refresh_cpa_fields(self):
         """未开启 SSO→auth 时隐藏 CPA 目录/远程配置。"""
@@ -3370,6 +3689,7 @@ class GrokRegisterGUI:
                 self.outlook_rt_client_id_var.get().strip()
                 or outlook_rt_provider.DEFAULT_CLIENT_ID
             )
+            self._apply_icloud_gui_config()
             config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
             _mode_text = str(self.cpa_token_mode_var.get()).strip()
             if "协议" in _mode_text:
@@ -3492,6 +3812,7 @@ class GrokRegisterGUI:
             self.outlook_rt_client_id_var.get().strip()
             or outlook_rt_provider.DEFAULT_CLIENT_ID
         )
+        self._apply_icloud_gui_config()
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         _mode_text = str(self.cpa_token_mode_var.get()).strip()
         if "协议" in _mode_text:
@@ -3520,6 +3841,19 @@ class GrokRegisterGUI:
         if config["email_provider"] == "mailnest" and not config["mailnest_api_key"]:
             self.log("[!] MailNest 模式需要先填写 MailNest API Key")
             return
+        if is_icloud_provider(config["email_provider"]):
+            missing = []
+            if not config.get("icloud_cookies"):
+                missing.append("iCloud Cookies")
+            if not config.get("icloud_temp_mail_base"):
+                missing.append("Temp-Mail Base")
+            if not config.get("icloud_temp_mail_password"):
+                missing.append("Temp-Mail Admin 密码")
+            if not config.get("icloud_temp_mail_target"):
+                missing.append("HME 转发目标邮箱")
+            if missing:
+                self.log(f"[!] iCloud 模式缺少配置: {', '.join(missing)}")
+                return
         if config["email_provider"] == "outlook_rt":
             inv = get_outlook_rt_inventory()
             if not inv:
@@ -3737,6 +4071,7 @@ class GrokRegisterGUI:
                             msg = str(mail_exc)
                             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                                 wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                                release_active_icloud_lease(reason="otp_timeout", log_callback=wlog)
                                 restart_browser(log_callback=wlog)
                                 sleep_with_cancel(1, self.should_stop)
                                 continue
@@ -3792,6 +4127,7 @@ class GrokRegisterGUI:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
                     cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
                     self._record_success()
+                    commit_active_icloud_as_registered(email=email, log_callback=wlog)
                     retry_count_for_slot = 0
                     i += 1
                     if cpa_ok:
@@ -3809,9 +4145,11 @@ class GrokRegisterGUI:
                             reason=f"已成功 {self.success_count} 个账号，执行定期清理",
                         )
                 except RegistrationCancelled:
+                    release_active_icloud_lease(reason="cancelled", log_callback=wlog)
                     wlog("[!] 注册被用户停止")
                     break
                 except EmailDomainRejected as exc:
+                    release_active_icloud_lease(reason="domain_rejected", log_callback=wlog)
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
@@ -3821,6 +4159,7 @@ class GrokRegisterGUI:
                     )
                     wlog("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
                 except AccountRetryNeeded as exc:
+                    release_active_icloud_lease(reason="retry", log_callback=wlog)
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
                         wlog(
@@ -3836,6 +4175,7 @@ class GrokRegisterGUI:
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
+                    release_active_icloud_lease(reason="fail", log_callback=wlog)
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
@@ -4129,6 +4469,10 @@ def run_registration_cli(count):
                         )
                         local_success += 1
                         mark_successful_account()
+                        commit_active_icloud_as_registered(
+                            email=email,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         i += 1
                         retry = 0
                         if cpa_ok:
@@ -4150,8 +4494,16 @@ def run_registration_cli(count):
                             rotate_idx += 1
                             cli_log(f"[W{wid+1}] [*] 已成功 {local_success} 个，下号换 IP #{rotate_idx}")
                     except RegistrationCancelled:
+                        release_active_icloud_lease(
+                            reason="cancelled",
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         break
                     except EmailDomainRejected as exc:
+                        release_active_icloud_lease(
+                            reason="domain_rejected",
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
@@ -4171,6 +4523,10 @@ def run_registration_cli(count):
                         )
                         mark_slot_completed()
                     except AccountRetryNeeded as exc:
+                        release_active_icloud_lease(
+                            reason="retry",
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         retry += 1
                         if retry > max_slot_retry:
                             kind = classify_failure(exc)
@@ -4184,6 +4540,10 @@ def run_registration_cli(count):
                             )
                             mark_slot_completed()
                     except Exception as exc:
+                        release_active_icloud_lease(
+                            reason="fail",
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        )
                         msg = str(exc)
                         blank_ui = (
                             "inputs=none" in msg
@@ -4510,6 +4870,7 @@ def run_registration_cli(count):
                 cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
                 success_count += 1
                 mark_successful_account()
+                commit_active_icloud_as_registered(email=email, log_callback=cli_log)
                 retry_count_for_slot = 0
                 i += 1
                 if cpa_ok:
@@ -4535,9 +4896,11 @@ def run_registration_cli(count):
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
             except RegistrationCancelled:
+                release_active_icloud_lease(reason="cancelled", log_callback=cli_log)
                 cli_log("[!] 注册被停止")
                 break
             except EmailDomainRejected as exc:
+                release_active_icloud_lease(reason="domain_rejected", log_callback=cli_log)
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
@@ -4556,6 +4919,7 @@ def run_registration_cli(count):
                 cli_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
                 mark_slot_completed()
             except AccountRetryNeeded as exc:
+                release_active_icloud_lease(reason="retry", log_callback=cli_log)
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
                     cli_log(
@@ -4580,6 +4944,7 @@ def run_registration_cli(count):
                     )
                     mark_slot_completed()
             except Exception as exc:
+                release_active_icloud_lease(reason="fail", log_callback=cli_log)
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1

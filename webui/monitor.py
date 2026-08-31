@@ -54,6 +54,14 @@ try:
         save_email_provider_config,
         test_email_provider_config,
     )
+    from webui.icloud_ops import (
+        inventory_snapshot as icloud_inventory_snapshot,
+        notify_config_updated as notify_icloud_config_updated,
+        request_run_now as request_icloud_run_now,
+        runtime_snapshot as icloud_runtime_snapshot,
+        start_scheduler as start_icloud_scheduler,
+        sync_inventory as sync_icloud_inventory,
+    )
     from webui.process_utils import (
         find_managed_processes,
         terminate_managed_processes,
@@ -96,6 +104,14 @@ except ImportError:  # running as script from webui/
         read_email_provider_config,
         save_email_provider_config,
         test_email_provider_config,
+    )
+    from icloud_ops import (  # type: ignore
+        inventory_snapshot as icloud_inventory_snapshot,
+        notify_config_updated as notify_icloud_config_updated,
+        request_run_now as request_icloud_run_now,
+        runtime_snapshot as icloud_runtime_snapshot,
+        start_scheduler as start_icloud_scheduler,
+        sync_inventory as sync_icloud_inventory,
     )
     from process_utils import (  # type: ignore
         find_managed_processes,
@@ -1580,7 +1596,28 @@ HTML = r"""<!DOCTYPE html>
   }
   .mail-provider-fields .field { min-width: 0; gap: 5px; }
   .mail-provider-fields input,
-  .mail-provider-fields select { width: 100%; min-height: 40px; }
+  .mail-provider-fields select,
+  .mail-provider-fields textarea { width: 100%; min-height: 40px; }
+  .mail-provider-fields textarea { min-height: 88px; }
+  .mail-provider-fields .field.wide { grid-column: 1 / -1; }
+  .icloud-ops {
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+    display: grid;
+    gap: 12px;
+  }
+  .icloud-ops-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .icloud-ops-head h3 { margin: 0; font-size: 14px; }
+  .icloud-ops-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .icloud-ops-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  .icloud-ops-metrics div { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+  .icloud-ops-metrics span { display: block; color: var(--muted); font-size: 10px; }
+  .icloud-ops-metrics strong { font-size: 16px; }
+  .icloud-ops-table-wrap { overflow: auto; max-height: 240px; border: 1px solid var(--border); border-radius: 10px; }
+  .icloud-ops-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .icloud-ops-table th, .icloud-ops-table td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+  .icloud-ops-log { min-height: 72px; max-height: 140px; overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; white-space: pre-wrap; font-size: 11px; }
   .mail-secret-wrap { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
   .mail-secret-wrap button { min-width: 54px; min-height: 40px; padding-inline: 10px; font-size: 11px; }
   .mail-secret-wrap.pending-clear input { border-color: var(--warn); }
@@ -2127,9 +2164,9 @@ HTML = r"""<!DOCTYPE html>
             <summary>邮箱 API 返回 401 或请求超时</summary>
             <div class="faq-answer">401 先检查对应邮箱服务的 key 和 <code>auth_mode</code>。访问 workers.dev 超时时，在配置中显式填写代理，不要只依赖桌面进程可能无法继承的 HTTP_PROXY 环境变量。</div>
           </details>
-          <details class="faq-item" data-faq-item data-search="邮箱服务 provider cloudflare duckmail yyds mailnest cloudmail moemail outlook_rt inbucket 自建 jsonl refresh_token api 测试 域名轮换">
+          <details class="faq-item" data-faq-item data-search="邮箱服务 provider cloudflare duckmail yyds mailnest cloudmail moemail outlook_rt inbucket icloud hide my email cookies temp-mail 自建 jsonl refresh_token api 测试 域名轮换">
             <summary>如何配置邮箱服务</summary>
-            <div class="faq-answer">打开顶部“邮箱服务”，选择当前使用的服务商后填写对应 API 配置，保存并测试连通性。Outlook RT 库存模式填写 jsonl（email + refresh_token）路径即可，无需 client_id。Inbucket 自建模式填写实例地址和收信根域名（可逗号分隔多个轮换，MX 需指向实例），随机子域级数可选（需泛解析收信）。自有域名轮换位于同页高级设置；只有 xAI 明确拒绝域名才累计，邮箱 API 和验证码异常不会处罚域名。</div>
+            <div class="faq-answer">打开顶部“邮箱服务”，选择当前使用的服务商后填写对应 API 配置，保存并测试连通性。Outlook RT 库存模式填写 jsonl（email + refresh_token）路径即可，无需 client_id。Inbucket 自建模式填写实例地址和收信根域名（可逗号分隔多个轮换，MX 需指向实例），随机子域级数可选（需泛解析收信）。iCloud Hide My Email 需要 Apple 网页 Cookie，以及 HME 转发到的 Cloudflare Temp-Mail Admin 收信配置；同页可查看库存、同步 Apple 并定时预创建别名。自有域名轮换位于同页高级设置；只有 xAI 明确拒绝域名才累计，邮箱 API 和验证码异常不会处罚域名。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="黑名单 asn 清除 重置 baseline 风控 出口">
             <summary>黑名单有什么作用，可以清除吗</summary>
@@ -2238,6 +2275,30 @@ HTML = r"""<!DOCTYPE html>
           <span class="mail-provider-meta mono" id="mail-provider-updated">尚未读取</span>
         </div>
         <div class="msg mail-provider-result" id="mail-provider-msg" role="status" aria-live="polite"></div>
+        <section class="icloud-ops" id="icloud-ops" hidden>
+          <div class="icloud-ops-head">
+            <h3>iCloud 库存与自动创建</h3>
+            <span class="badge" id="icloud-scheduler-badge">未启用</span>
+          </div>
+          <div class="icloud-ops-metrics" id="icloud-ops-metrics">
+            <div><span>空闲</span><strong id="icloud-stat-free">--</strong></div>
+            <div><span>已租用</span><strong id="icloud-stat-leased">--</strong></div>
+            <div><span>已注册</span><strong id="icloud-stat-registered">--</strong></div>
+            <div><span>今日创建</span><strong id="icloud-stat-today">--</strong></div>
+          </div>
+          <div class="icloud-ops-actions">
+            <button id="icloud-sync-button" onclick="syncIcloudInventory()">立即同步 Apple</button>
+            <button class="primary" id="icloud-run-now-button" onclick="runIcloudCreateNow()">立即创建一批</button>
+            <span class="mail-provider-meta mono" id="icloud-next-run">下次计划 --</span>
+          </div>
+          <div class="icloud-ops-table-wrap">
+            <table class="icloud-ops-table">
+              <thead><tr><th>别名邮箱</th><th>状态</th><th>标签 / 标记</th><th>失败原因</th></tr></thead>
+              <tbody id="icloud-inventory-rows"><tr><td colspan="4">尚未读取库存</td></tr></tbody>
+            </table>
+          </div>
+          <pre class="icloud-ops-log" id="icloud-scheduler-log">等待调度状态</pre>
+        </section>
       </section>
 
       <details class="domain-advanced" id="domain-advanced">
@@ -2944,6 +3005,10 @@ function emailProviderFieldControl(field) {
   const id = "mail-field-" + field.name;
   const raw = emailProviderData && emailProviderData.values ? emailProviderData.values[field.name] : "";
   const value = raw ?? field.default ?? "";
+  if (field.type === "bool") {
+    const selected = value === true || value === "true";
+    return `<select id="${esc(id)}" data-mail-field="${esc(field.name)}"><option value="true" ${selected ? "selected" : ""}>启用</option><option value="false" ${selected ? "" : "selected"}>关闭</option></select>`;
+  }
   if (field.type === "select") {
     const options = (field.options || []).map(option => {
       const optionValue = typeof option === "object" ? option.value : option;
@@ -2955,8 +3020,17 @@ function emailProviderFieldControl(field) {
   const isSecret = field.secret === true;
   const configured = isSecret && emailProviderData && emailProviderData.secret_configured && emailProviderData.secret_configured[field.name];
   const placeholder = configured ? "已配置，留空保留" : (field.placeholder || "");
-  const type = isSecret ? "password" : (["url", "email"].includes(field.type) ? field.type : "text");
-  const input = `<input id="${esc(id)}" data-mail-field="${esc(field.name)}" type="${type}" value="${isSecret ? "" : esc(value)}" placeholder="${esc(placeholder)}" autocomplete="${isSecret ? "new-password" : "off"}" spellcheck="false" ${isSecret ? `oninput="emailProviderSecretInput('${field.name}')"` : ""}/>`;
+  if (field.type === "textarea") {
+    const area = `<textarea id="${esc(id)}" data-mail-field="${esc(field.name)}" rows="4" placeholder="${esc(placeholder)}" autocomplete="${isSecret ? "new-password" : "off"}" spellcheck="false" ${isSecret ? `oninput="emailProviderSecretInput('${field.name}')"` : ""}>${isSecret ? "" : esc(value)}</textarea>`;
+    if (!isSecret) return area;
+    const clearArea = configured ? `<button type="button" data-mail-secret-button="${esc(field.name)}" onclick="toggleEmailProviderSecret('${field.name}')">清除</button>` : "";
+    const noteArea = configured ? "已保存密钥" : "尚未配置";
+    return `<div class="mail-secret-wrap" data-mail-secret-wrap="${esc(field.name)}">${area}${clearArea}</div><div class="mail-secret-note" data-mail-secret-note="${esc(field.name)}">${noteArea}</div>`;
+  }
+  const type = field.type === "int" ? "number" : (isSecret ? "password" : (["url", "email"].includes(field.type) ? field.type : "text"));
+  const min = field.min != null ? ` min="${esc(field.min)}"` : "";
+  const max = field.max != null ? ` max="${esc(field.max)}"` : "";
+  const input = `<input id="${esc(id)}" data-mail-field="${esc(field.name)}" type="${type}" value="${isSecret ? "" : esc(value)}" placeholder="${esc(placeholder)}" autocomplete="${isSecret ? "new-password" : "off"}" spellcheck="false"${min}${max} ${isSecret ? `oninput="emailProviderSecretInput('${field.name}')"` : ""}/>`;
   if (!isSecret) return input;
   const clear = configured ? `<button type="button" data-mail-secret-button="${esc(field.name)}" onclick="toggleEmailProviderSecret('${field.name}')">清除</button>` : "";
   const note = configured ? "已保存密钥" : "尚未配置";
@@ -2978,8 +3052,15 @@ function renderEmailProviderFields(provider) {
   status.textContent = definition.configured ? "已配置" : "待配置";
   status.className = "badge " + (definition.configured ? "ok" : "warn");
   document.getElementById("mail-provider-fields").innerHTML = (definition.fields || []).map(field =>
-    `<div class="field"><label for="mail-field-${esc(field.name)}">${esc(field.label)}</label>${emailProviderFieldControl(field)}</div>`
+    `<div class="field${field.wide ? " wide" : ""}"><label for="mail-field-${esc(field.name)}">${esc(field.label)}</label>${emailProviderFieldControl(field)}</div>`
   ).join("") || '<div class="field"><label>服务配置</label><input disabled value="该服务商没有可编辑字段"/></div>';
+  const icloudOps = document.getElementById("icloud-ops");
+  if (icloudOps) {
+    icloudOps.hidden = definition.id !== "icloud";
+    if (definition.id === "icloud") {
+      refreshIcloudOps();
+    }
+  }
   const domainProvider = document.getElementById("domain-provider");
   if (domainProvider && ["cloudflare", "cloudmail", "moemail", "yyds"].includes(definition.id)) {
     domainProvider.value = definition.id;
@@ -3037,7 +3118,9 @@ function collectEmailProviderSettings() {
   (definition && definition.fields || []).forEach(field => {
     const input = document.getElementById("mail-field-" + field.name);
     if (!input) return;
-    settings[field.name] = field.name === "moemail_expiry_ms" ? Number(input.value) : input.value;
+    if (field.type === "bool") settings[field.name] = input.value === "true";
+    else if (field.type === "int" || field.name === "moemail_expiry_ms") settings[field.name] = Number(input.value);
+    else settings[field.name] = input.value;
   });
   return settings;
 }
@@ -3064,6 +3147,7 @@ async function saveEmailProviderConfig() {
     }) });
     renderEmailProviderConfig(result);
     setMsg("mail-provider-msg", result.provider_label + " 配置已保存", "ok");
+    if (selectedEmailProvider === "icloud") refreshIcloudOps();
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
   button.disabled = false;
 }
@@ -3078,6 +3162,73 @@ async function testEmailProviderConnection() {
       clear_secrets: Array.from(clearedEmailSecrets),
     }) });
     setMsg("mail-provider-msg", result.detail || "连接正常", "ok");
+  } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+function formatIcloudTime(value) {
+  if (!value) return "未计划";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "未计划" : date.toLocaleString("zh-CN", { hour12: false });
+}
+function renderIcloudInventory(data) {
+  const stats = (data && data.stats) || {};
+  document.getElementById("icloud-stat-free").textContent = stats.free ?? 0;
+  document.getElementById("icloud-stat-leased").textContent = stats.leased ?? 0;
+  document.getElementById("icloud-stat-registered").textContent = stats.registered ?? 0;
+  const body = document.getElementById("icloud-inventory-rows");
+  const aliases = (data && data.aliases) || [];
+  if (!aliases.length) {
+    body.innerHTML = `<tr><td colspan="4">${esc((data && data.error) || "暂无本地库存")}</td></tr>`;
+    return;
+  }
+  body.innerHTML = aliases.map(alias => `<tr><td>${esc(alias.email || "-")}</td><td>${esc(alias.state || "-")}</td><td>${esc([alias.label, ...(alias.note_tags || [])].filter(Boolean).join(" / ") || "-")}</td><td>${esc(alias.last_fail_reason || "-")}</td></tr>`).join("");
+}
+function renderIcloudRuntime(runtime) {
+  const labels = { idle: "等待中", running: "创建中", success: "上次成功", partial: "部分成功", failed: "上次失败" };
+  const badge = document.getElementById("icloud-scheduler-badge");
+  badge.textContent = runtime && runtime.enabled ? (`已启用 / 每 ${runtime.interval_minutes} 分钟`) : "未启用";
+  badge.className = "badge " + (runtime && runtime.enabled ? "ok" : "warn");
+  document.getElementById("icloud-stat-today").textContent = runtime && runtime.today_total_records != null ? runtime.today_total_records : 0;
+  document.getElementById("icloud-next-run").textContent = "下次计划 " + formatIcloudTime(runtime && runtime.next_run_at);
+  document.getElementById("icloud-run-now-button").disabled = Boolean(runtime && runtime.running);
+  const logs = (runtime && runtime.logs) || [];
+  document.getElementById("icloud-scheduler-log").textContent = logs.length
+    ? logs.slice(-12).map(item => `[${formatIcloudTime(item.time)}] ${item.message}`).join("\n")
+    : (runtime && runtime.last_error ? runtime.last_error : "暂无调度日志");
+}
+async function refreshIcloudOps() {
+  const panel = document.getElementById("icloud-ops");
+  if (!panel || panel.hidden) return;
+  try {
+    const [runtime, inventory] = await Promise.all([
+      api("/api/icloud-auto-create?_=" + Date.now()),
+      api("/api/icloud-inventory?_=" + Date.now()),
+    ]);
+    renderIcloudRuntime(runtime.runtime || {});
+    renderIcloudInventory(inventory);
+  } catch (e) {
+    document.getElementById("icloud-scheduler-log").textContent = String(e.message || e);
+  }
+}
+async function syncIcloudInventory() {
+  const button = document.getElementById("icloud-sync-button");
+  button.disabled = true;
+  setMsg("mail-provider-msg", "正在同步 Apple 别名...", "");
+  try {
+    const result = await api("/api/icloud-inventory/sync", { method: "POST", body: "{}" });
+    renderIcloudInventory(result.inventory || result);
+    setMsg("mail-provider-msg", "Apple 别名同步完成", "ok");
+  } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
+  button.disabled = false;
+}
+async function runIcloudCreateNow() {
+  const button = document.getElementById("icloud-run-now-button");
+  button.disabled = true;
+  setMsg("mail-provider-msg", "已请求立即创建 iCloud 别名...", "");
+  try {
+    const result = await api("/api/icloud-auto-create/run-now", { method: "POST", body: "{}" });
+    renderIcloudRuntime(result.runtime || {});
+    setMsg("mail-provider-msg", "已开始创建一批 iCloud 别名", "ok");
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
   button.disabled = false;
 }
@@ -3913,7 +4064,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/icloud-auto-create", "/api/icloud-inventory"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -3972,6 +4123,18 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/email-domains":
             try:
                 self._json(200, read_email_domain_pool())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/icloud-auto-create":
+            try:
+                self._json(200, icloud_runtime_snapshot())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/icloud-inventory":
+            try:
+                self._json(200, icloud_inventory_snapshot())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
@@ -4104,11 +4267,27 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("settings") or {},
                     clear_secrets=body.get("clear_secrets"),
                 )
+                try:
+                    notify_icloud_config_updated()
+                except Exception:
+                    pass
                 self._json(200, result)
             except ValueError as e:
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/icloud-auto-create/run-now":
+            try:
+                self._json(200, request_icloud_run_now())
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/icloud-inventory/sync":
+            try:
+                self._json(200, sync_icloud_inventory())
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/email-provider/test":
             try:
@@ -4259,6 +4438,10 @@ def main():
             flush=True,
         )
     print(f"[monitor] http://{host}:{BIND_PORT}/  (bound {host}:{BIND_PORT})", flush=True)
+    try:
+        start_icloud_scheduler()
+    except Exception as exc:
+        print(f"[monitor] iCloud scheduler start skipped: {exc}", flush=True)
     httpd.serve_forever()
 
 

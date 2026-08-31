@@ -20,6 +20,9 @@ proxies.txt
 proxies*.txt
 !proxies.example.txt
 stickies*.txt
+icloud_alias_inventory.db
+icloud_alias_inventory.json
+icloud_used_emails.json
 .next_action_id.cache
 *.bak*
 *.fixed-keep

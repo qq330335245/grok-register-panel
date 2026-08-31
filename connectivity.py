@@ -272,6 +272,31 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
                 return "邮箱API", False, f"Inbucket HTTP {resp.status_code}"
             return "邮箱API", True, f"Inbucket 可达 HTTP {resp.status_code}（域名 {','.join(domains)[:80]}）"
 
+        if provider == "icloud":
+            from email_providers import icloud as icloud_provider
+
+            cookies = str(config.get("icloud_cookies") or "").strip()
+            base = str(config.get("icloud_temp_mail_base") or "").strip()
+            password = str(config.get("icloud_temp_mail_password") or "").strip()
+            target = str(config.get("icloud_temp_mail_target") or "").strip()
+            if not cookies:
+                return "邮箱API", False, "未配置 icloud_cookies"
+            if not base:
+                return "邮箱API", False, "未配置 icloud_temp_mail_base"
+            if not password:
+                return "邮箱API", False, "未配置 icloud_temp_mail_password"
+            if not target:
+                return "邮箱API", False, "未配置 icloud_temp_mail_target"
+            ok, detail = icloud_provider.check_health(
+                cookies_raw=cookies,
+                temp_mail_base=base,
+                temp_mail_password=password,
+                temp_mail_custom_auth=str(config.get("icloud_temp_mail_custom_auth") or ""),
+                platform=str(config.get("icloud_platform_tag") or "grok"),
+                http_get=http_get,
+            )
+            return "邮箱API", bool(ok), str(detail)[:300]
+
         if provider == "outlook_rt":
             from email_providers import outlook_rt as outlook_rt_provider
 

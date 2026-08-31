@@ -221,6 +221,9 @@ def test_email_service_and_domain_rotation_panel_structure():
     assert 'function testEmailProviderConnection(' in mon
     assert 'function toggleEmailProviderSecret(' in mon
     assert '/api/email-provider' in mon
+    assert 'id="icloud-ops"' in html
+    assert '/api/icloud-auto-create' in mon
+    assert '/api/icloud-inventory' in mon
     assert '/api/email-provider/test' in mon
     assert 'Apple Mail API' not in html
     assert 'id="domain-advanced"' in html

@@ -356,35 +356,42 @@ def test_probe_proxy_falls_back_to_ipv6_after_v4_socks_failure():
         def json(self):
             return {"ip": "2001:db8::8", "org": "AS64500 Example"}
 
-    class FakeSession:
-        trust_env = False
+    def fake_get(url, **_kwargs):
+        if "v6.ipinfo.io" in str(url):
+            return FakeResponse()
+        raise RuntimeError(
+            "curl: (97) cannot complete SOCKS5 connection to ipinfo.io. (4)"
+        )
 
-        def get(self, url, **_kwargs):
-            if "v6.ipinfo.io" in url or "api64.ipify.org" in url:
-                return FakeResponse()
-            raise RuntimeError(
-                "SOCKSHTTPSConnectionPool(host='api.ipify.org', port=443): "
-                "Max retries exceeded with url: /?format=json (Caused by NewConnectionError)"
-            )
+    import types
 
-    class FakeRequests:
-        Session = FakeSession
-
-    previous_requests = sys.modules.get("requests")
     previous_xai = proxy_store.probe_xai_signup
-    sys.modules["requests"] = FakeRequests()
+    previous_cffi = sys.modules.get("curl_cffi")
+    previous_cffi_req = sys.modules.get("curl_cffi.requests")
+    fake_cffi = types.ModuleType("curl_cffi")
+    fake_req = types.ModuleType("curl_cffi.requests")
+    fake_req.get = fake_get
+    fake_cffi.requests = fake_req
+    sys.modules["curl_cffi"] = fake_cffi
+    sys.modules["curl_cffi.requests"] = fake_req
     proxy_store.probe_xai_signup = lambda *args, **kwargs: "HTTP 200"
     try:
-        result = proxy_store.probe_proxy("socks5h://g2a.{account}:token@127.0.0.1:10800")
+        result = proxy_store.probe_proxy(
+            "socks5h://g2a.{account}:token@127.0.0.1:10800"
+        )
         assert result["ok"] is True
         assert result["exit_ip"] == "2001:db8::8"
         assert result["asn"] == 64500
     finally:
-        if previous_requests is None:
-            sys.modules.pop("requests", None)
-        else:
-            sys.modules["requests"] = previous_requests
         proxy_store.probe_xai_signup = previous_xai
+        if previous_cffi is None:
+            sys.modules.pop("curl_cffi", None)
+        else:
+            sys.modules["curl_cffi"] = previous_cffi
+        if previous_cffi_req is None:
+            sys.modules.pop("curl_cffi.requests", None)
+        else:
+            sys.modules["curl_cffi.requests"] = previous_cffi_req
 
 
 if __name__ == "__main__":

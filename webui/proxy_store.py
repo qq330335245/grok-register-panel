@@ -37,7 +37,7 @@ ALLOWED_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ALLOWED_STATUSES = {"unknown", "healthy", "unhealthy", "cooldown"}
 MAX_IMPORT_ITEMS = 500
 MAX_TEST_ITEMS = 200
-DEFAULT_TEST_TIMEOUT = 8.0
+DEFAULT_TEST_TIMEOUT = 18.0
 NETWORK_COOLDOWN_SECONDS = max(
     10, int(os.environ.get("PROXY_NETWORK_COOLDOWN_SECONDS", "90"))
 )
@@ -944,17 +944,13 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
         account=STICKY_PROBE_ACCOUNT,
         account_id=STICKY_PROBE_ACCOUNT,
     )
-    timeout = max(2.0, min(float(timeout), 20.0))
-    import requests
+    timeout = max(5.0, min(float(timeout), 25.0))
+    from curl_cffi import requests as curl_requests
 
-    session = requests.Session()
-    session.trust_env = False
-    proxies = {"http": normalized, "https": normalized}
     families = (
         (
             "v4",
             (
-                "https://ipwho.is/",
                 "https://ipinfo.io/json",
                 "https://api.ipify.org?format=json",
             ),
@@ -971,13 +967,17 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
     result = None
     started = time.monotonic()
     for _family, endpoints in families:
-        family_blocked = False
         for endpoint in endpoints:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining < 2.0:
+                break
             try:
-                response = session.get(
+                response = curl_requests.get(
                     endpoint,
-                    proxies=proxies,
-                    timeout=(min(4.0, timeout), timeout),
+                    proxy=normalized,
+                    timeout=min(8.0, remaining),
+                    impersonate="chrome",
+                    verify=False,
                     headers={"Accept": "application/json", "User-Agent": "GrokRegister/1"},
                 )
                 response.raise_for_status()
@@ -985,8 +985,6 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
                     payload = response.json()
                 except Exception:
                     payload = getattr(response, "text", "")
-                if isinstance(payload, dict) and endpoint.startswith("https://ipwho.is") and payload.get("success") is False:
-                    raise RuntimeError("探测服务拒绝了请求")
                 ip, asn, org = _parse_probe_payload(payload)
                 result = {
                     "ok": True,
@@ -1000,13 +998,13 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
             except Exception as exc:
                 last_error = exc
                 if _socks_family_blocked(exc):
-                    family_blocked = True
                     break
         if result is not None:
             break
     if result is None:
         raise RuntimeError(_probe_error_message(last_error))
-    probe_xai_signup(normalized, timeout=timeout)
+    xai_budget = max(6.0, timeout - (time.monotonic() - started))
+    probe_xai_signup(normalized, timeout=min(12.0, xai_budget))
     return result
 
 

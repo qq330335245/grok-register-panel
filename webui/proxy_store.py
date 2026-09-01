@@ -966,16 +966,17 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
     last_error = None
     result = None
     started = time.monotonic()
-    for _family, endpoints in families:
+    for family, endpoints in families:
         for endpoint in endpoints:
             remaining = timeout - (time.monotonic() - started)
             if remaining < 2.0:
                 break
+            per_try = 5.0 if family == "v4" else 12.0
             try:
                 response = curl_requests.get(
                     endpoint,
                     proxy=normalized,
-                    timeout=min(8.0, remaining),
+                    timeout=min(per_try, remaining),
                     impersonate="chrome",
                     verify=False,
                     headers={"Accept": "application/json", "User-Agent": "GrokRegister/1"},

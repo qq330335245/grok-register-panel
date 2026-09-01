@@ -777,6 +777,27 @@ def bind_account_proxy(template: str, email: str = "") -> str:
     return url
 
 
+def _mailbox_or_proxy_error_prefix(exc: object) -> str:
+    low = str(exc or "").lower()
+    if any(
+        marker in low
+        for marker in (
+            "cloudflare",
+            "icloud",
+            "邮箱",
+            "mailbox",
+            "mailnest",
+            "inbucket",
+            "outlook",
+            "moemail",
+            "yyds",
+            "cloudmail",
+        )
+    ):
+        return "领取邮箱失败"
+    return "没有可用代理"
+
+
 def assign_worker_proxy(worker_id: int, rotate_idx: int = 0, log_callback=None) -> str:
     """Pick a pool node and expand grok2api-style {account}/{email}/{id} templates."""
     template = pick_proxy_for_worker(worker_id, rotate_idx)
@@ -4496,7 +4517,7 @@ class GrokRegisterGUI:
                     assign_worker_proxy(worker_id, rotate_idx, wlog)
                 except Exception as proxy_exc:
                     wlog(
-                        f"[-] 下号没有可用代理: "
+                        f"[-] 下号{_mailbox_or_proxy_error_prefix(proxy_exc)}: "
                         f"{redact_sensitive_log_line(str(proxy_exc))}"
                     )
                     break
@@ -4653,7 +4674,7 @@ def run_registration_cli(count):
                     local_fail = n
                     local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
                     cli_log(
-                        f"[W{wid+1}] [-] 没有可用代理，停止该 worker: "
+                        f"[W{wid+1}] [-] {_mailbox_or_proxy_error_prefix(proxy_exc)}，停止该 worker: "
                         f"{redact_sensitive_log_line(str(proxy_exc))}"
                     )
                     return
@@ -5339,7 +5360,7 @@ def run_registration_cli(count):
                 px = assign_worker_proxy(0, single_rotate_idx, cli_log)
             except Exception as proxy_exc:
                 cli_log(
-                    f"[-] 下号没有可用代理: "
+                    f"[-] 下号{_mailbox_or_proxy_error_prefix(proxy_exc)}: "
                     f"{redact_sensitive_log_line(str(proxy_exc))}"
                 )
                 remaining = max(count - i, 0)

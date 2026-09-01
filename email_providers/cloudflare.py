@@ -120,6 +120,16 @@ def create_temp_address(
             if resp.status_code >= 400:
                 # 只有明确的地址冲突会因换名恢复；认证、域名和字段错误直接抛出。
                 retryable = _is_address_collision(resp.status_code, body_text)
+                invalid_domain = (
+                    int(resp.status_code or 0) == 400
+                    and "invalid domain" in body_text.lower()
+                )
+                if invalid_domain and selected_domain:
+                    selected_domain = ""
+                    last_err = Exception(
+                        f"Cloudflare {path} 拒绝了配置域名，改用服务默认域"
+                    )
+                    continue
                 if retryable and attempt < 3:
                     last_err = Exception(
                         f"Cloudflare {path} HTTP {resp.status_code}: 地址已存在"

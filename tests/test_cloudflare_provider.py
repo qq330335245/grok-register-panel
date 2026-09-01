@@ -92,6 +92,30 @@ def test_nonretryable_400_is_not_retried_or_echoed():
     assert len(calls) == 1
 
 
+def test_invalid_domain_retries_without_domain():
+    calls = []
+    responses = [
+        FakeResponse(400, body="Failed to create address: Invalid domain"),
+        FakeResponse(200, data={"address": "ok@konsin.example", "jwt": "jwt-ok"}),
+    ]
+
+    def fake_post(url, **kwargs):
+        calls.append(kwargs.get("json") or {})
+        return responses.pop(0)
+
+    result = _without_sleep(
+        lambda: cloudflare.create_temp_address(
+            fake_post,
+            "https://mail.example",
+            domain="bohef4.com",
+            randomize_subdomain=False,
+        )
+    )
+    assert result == ("ok@konsin.example", "jwt-ok")
+    assert calls[0].get("domain") == "bohef4.com"
+    assert "domain" not in calls[1]
+
+
 def test_admin_fallback_respects_random_subdomain_opt_out():
     calls = []
 
@@ -119,5 +143,6 @@ def test_admin_fallback_respects_random_subdomain_opt_out():
 if __name__ == "__main__":
     test_address_collision_retries_with_admin_payload()
     test_nonretryable_400_is_not_retried_or_echoed()
+    test_invalid_domain_retries_without_domain()
     test_admin_fallback_respects_random_subdomain_opt_out()
     print("OK cloudflare provider")

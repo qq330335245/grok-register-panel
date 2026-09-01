@@ -37,7 +37,7 @@ ALLOWED_SCHEMES = {"http", "https", "socks5", "socks5h"}
 ALLOWED_STATUSES = {"unknown", "healthy", "unhealthy", "cooldown"}
 MAX_IMPORT_ITEMS = 500
 MAX_TEST_ITEMS = 200
-DEFAULT_TEST_TIMEOUT = 18.0
+DEFAULT_TEST_TIMEOUT = 30.0
 NETWORK_COOLDOWN_SECONDS = max(
     10, int(os.environ.get("PROXY_NETWORK_COOLDOWN_SECONDS", "90"))
 )
@@ -1003,8 +1003,14 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
             break
     if result is None:
         raise RuntimeError(_probe_error_message(last_error))
-    xai_budget = max(6.0, timeout - (time.monotonic() - started))
-    probe_xai_signup(normalized, timeout=min(12.0, xai_budget))
+    try:
+        probe_xai_signup(normalized, timeout=20.0)
+    except Exception as exc:
+        # Sticky probe identity is a different tunnel than per-mailbox sessions.
+        if is_sticky_template(url):
+            result["xai_warning"] = _probe_error_message(exc)
+        else:
+            raise
     return result
 
 

@@ -86,6 +86,102 @@ def test_unknown_bfs_is_queued_when_skip_enabled():
     assert record_calls == []
 
 
+def test_grok2api_web_uploads_before_cpa_write():
+    order = []
+    config_keys = (
+        "cpa_auto_add",
+        "cpa_auth_dir",
+        "cpa_remote_url",
+        "cpa_management_key",
+        "grok2api_auth_dir",
+        "grok2api_auto_upload",
+        "grok2api_upload_web",
+        "grok2api_upload_console",
+        "grok2api_base_url",
+        "grok2api_admin_user",
+        "grok2api_admin_password",
+        "bfs_check",
+        "cpa_token_mode",
+    )
+    previous_config = {key: register.config.get(key) for key in config_keys}
+    previous = (
+        register._resolve_cpa_proxy,
+        register._s2cpa.sso_to_token,
+        register._s2cpa.token_to_cpa_record,
+        register._s2cpa.write_cpa_auth,
+        register._s2cpa.write_grok2api_auth,
+        register._g2a_client.upload_sso_account,
+        register._g2a_client.upload_build_account,
+        register._g2a_client.token_to_grok2api_account,
+    )
+    with tempfile.TemporaryDirectory() as temp:
+        register.config.update(
+            {
+                "cpa_auto_add": True,
+                "cpa_auth_dir": str(Path(temp) / "cpa_auth"),
+                "cpa_remote_url": "",
+                "cpa_management_key": "",
+                "grok2api_auth_dir": str(Path(temp) / "g2a_auth"),
+                "grok2api_auto_upload": True,
+                "grok2api_upload_web": True,
+                "grok2api_upload_console": False,
+                "grok2api_base_url": "https://g2a.example.test",
+                "grok2api_admin_user": "admin",
+                "grok2api_admin_password": "secret",
+                "bfs_check": False,
+                "cpa_token_mode": "device_protocol",
+            }
+        )
+        register._resolve_cpa_proxy = lambda: ""
+        register._s2cpa.sso_to_token = lambda *_a, **_k: {
+            "access_token": "opaque-access-token",
+            "refresh_token": "opaque-refresh-token",
+        }
+        register._s2cpa.token_to_cpa_record = lambda *_a, **_k: {
+            "access_token": "opaque-access-token",
+            "refresh_token": "opaque-refresh-token",
+        }
+        register._s2cpa.write_cpa_auth = (
+            lambda *_a, **_k: order.append("cpa") or Path(temp) / "cpa.json"
+        )
+        register._s2cpa.write_grok2api_auth = (
+            lambda *_a, **_k: order.append("g2afile") or Path(temp) / "g2a.json"
+        )
+        register._g2a_client.token_to_grok2api_account = lambda *_a, **_k: {
+            "access_token": "opaque-access-token",
+            "refresh_token": "opaque-refresh-token",
+            "email": "a@b.com",
+        }
+        register._g2a_client.upload_sso_account = (
+            lambda *_a, **_k: order.append("web") or {"created": 1, "updated": 0}
+        )
+        register._g2a_client.upload_build_account = (
+            lambda *_a, **_k: order.append("build")
+            or {"created": 1, "updated": 0, "synced": 1, "syncFailed": 0}
+        )
+        try:
+            result = register.add_sso_to_cpa("sso=test-sso-token", email="a@b.com")
+        finally:
+            (
+                register._resolve_cpa_proxy,
+                register._s2cpa.sso_to_token,
+                register._s2cpa.token_to_cpa_record,
+                register._s2cpa.write_cpa_auth,
+                register._s2cpa.write_grok2api_auth,
+                register._g2a_client.upload_sso_account,
+                register._g2a_client.upload_build_account,
+                register._g2a_client.token_to_grok2api_account,
+            ) = previous
+            for key, value in previous_config.items():
+                if value is None:
+                    register.config.pop(key, None)
+                else:
+                    register.config[key] = value
+    assert result is True
+    assert order == ["web", "build", "cpa", "g2afile"]
+
+
 if __name__ == "__main__":
     test_unknown_bfs_is_queued_when_skip_enabled()
+    test_grok2api_web_uploads_before_cpa_write()
     print("OK bfs worker integration")

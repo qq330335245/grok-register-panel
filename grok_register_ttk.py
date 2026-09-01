@@ -1292,6 +1292,44 @@ def _upload_grok2api_accounts(token, sso="", email="", log_callback=None) -> boo
         delay = 2.0
     pending_file = str(config.get("grok2api_upload_pending_file", "") or "").strip()
     ok = True
+    # Web/Console first: they are SSO-only and finish quickly. Build import SSE can
+    # sit in phase=syncing long enough for the CPA-count orchestrator to SIGTERM.
+    for provider in channels:
+        label = "Web" if provider == "grok_web" else "Console"
+        try:
+            _g2a_log(
+                f"upload {label} SSO email={email or '-'} "
+                f"-> {_g2a_client.normalize_base_url(base_url)}"
+            )
+            result = _g2a_client.upload_sso_account(
+                base_url,
+                admin_user,
+                admin_password,
+                provider=provider,
+                sso_token=sso,
+                email=email,
+                log=_g2a_log,
+                retries=retries,
+                retry_delay_s=delay,
+            )
+            _g2a_log(
+                f"{label} upload OK created={result.get('created', 0)} "
+                f"updated={result.get('updated', 0)}"
+            )
+        except Exception as exc:
+            ok = False
+            _g2a_log(f"{label} upload failed after retries: {exc}")
+            try:
+                saved = _g2a_client.save_sso_upload_pending(
+                    provider,
+                    sso,
+                    email,
+                    base_dir=APP_DIR,
+                    error=str(exc),
+                )
+                _g2a_log(f"{label} SSO 已写入待导入文件 {saved}")
+            except Exception as save_exc:
+                _g2a_log(f"保存 {label} 待导入失败: {save_exc}")
     if need_build:
         entry = None
         try:
@@ -1335,42 +1373,6 @@ def _upload_grok2api_accounts(token, sso="", email="", log_callback=None) -> boo
                 _g2a_log(f"Build 凭据已写入待导入文件 {saved}")
             except Exception as save_exc:
                 _g2a_log(f"保存 Build 待导入失败: {save_exc}")
-    for provider in channels:
-        label = "Web" if provider == "grok_web" else "Console"
-        try:
-            _g2a_log(
-                f"upload {label} SSO email={email or '-'} "
-                f"-> {_g2a_client.normalize_base_url(base_url)}"
-            )
-            result = _g2a_client.upload_sso_account(
-                base_url,
-                admin_user,
-                admin_password,
-                provider=provider,
-                sso_token=sso,
-                email=email,
-                log=_g2a_log,
-                retries=retries,
-                retry_delay_s=delay,
-            )
-            _g2a_log(
-                f"{label} upload OK created={result.get('created', 0)} "
-                f"updated={result.get('updated', 0)}"
-            )
-        except Exception as exc:
-            ok = False
-            _g2a_log(f"{label} upload failed after retries: {exc}")
-            try:
-                saved = _g2a_client.save_sso_upload_pending(
-                    provider,
-                    sso,
-                    email,
-                    base_dir=APP_DIR,
-                    error=str(exc),
-                )
-                _g2a_log(f"{label} SSO 已写入待导入文件 {saved}")
-            except Exception as save_exc:
-                _g2a_log(f"保存 {label} 待导入失败: {save_exc}")
     if need_build and len(channels) == 2 and ok:
         _g2a_log("Web 与 Console 使用同一 SSO，grok2api 会建立绑定")
     return ok
@@ -1528,6 +1530,9 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
         if disable_bfs and record.get("bfs") is True:
             record["disabled"] = True
             _cpa_log("bfs 账号已标记 disabled=true")
+        # Remote grok2api import before local CPA write. The orchestrator treats a
+        # new CPA file as target-reached and SIGTERMs the batch; Web never ran.
+        _upload_grok2api_accounts(token, sso=sso, email=email, log_callback=log_callback)
         wrote_ok = False
         if auth_dir:
             try:
@@ -1550,7 +1555,6 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
                 wrote_ok = True
             except Exception as g2a_exc:
                 _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
-        _upload_grok2api_accounts(token, sso=sso, email=email, log_callback=log_callback)
         if not wrote_ok:
             _cpa_log("token 已换出但 CPA/Grok2API 均未写入成功")
             _append_sso_pending(email, sso, log_callback=log_callback)

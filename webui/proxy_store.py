@@ -247,6 +247,8 @@ def _probe_error_message(exc: object) -> str:
         return "代理 TLS 握手失败"
     if "proxyerror" in low or "unable to connect to proxy" in low or "connection refused" in low:
         return "无法连接代理"
+    if "newconnectionerror" in low or "max retries exceeded" in low:
+        return "出口探测失败（IPv4 目标不可达，常见于 IPv6 粘性）"
     match = re.search(r"(?:status|http)\s*(?:code)?\s*[:=]?\s*(\d{3})", low)
     if match:
         return f"探测服务返回 HTTP {match.group(1)}"
@@ -861,10 +863,29 @@ def record_proxy_result(url: object, outcome: str, error: object = "") -> bool:
     return changed
 
 
+def _socks_family_blocked(exc: object) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "(4)" in msg
+        or "host unreachable" in msg
+        or "network unreachable" in msg
+        or "cannot complete socks5" in msg
+        or "newconnectionerror" in msg
+        or "max retries exceeded" in msg
+    )
+
+
 def _parse_probe_payload(payload: object) -> tuple[str, int | None, str]:
+    if isinstance(payload, str):
+        text = payload.strip().split()[0] if payload.strip() else ""
+        try:
+            ipaddress.ip_address(text)
+        except ValueError as exc:
+            raise RuntimeError("探测服务返回了无效出口 IP") from exc
+        return text, None, ""
     if not isinstance(payload, dict):
         raise RuntimeError("探测服务返回了无效 JSON")
-    ip = str(payload.get("ip") or "").strip()
+    ip = str(payload.get("ip") or payload.get("query") or "").strip()
     if not ip:
         raise RuntimeError("探测服务没有返回出口 IP")
     try:
@@ -929,38 +950,60 @@ def probe_proxy(url: object, timeout: float = DEFAULT_TEST_TIMEOUT) -> dict:
     session = requests.Session()
     session.trust_env = False
     proxies = {"http": normalized, "https": normalized}
-    endpoints = (
-        "https://ipwho.is/",
-        "https://ipinfo.io/json",
-        "https://api.ipify.org?format=json",
+    families = (
+        (
+            "v4",
+            (
+                "https://ipwho.is/",
+                "https://ipinfo.io/json",
+                "https://api.ipify.org?format=json",
+            ),
+        ),
+        (
+            "v6",
+            (
+                "https://v6.ipinfo.io/json",
+                "https://api64.ipify.org?format=json",
+            ),
+        ),
     )
     last_error = None
     result = None
     started = time.monotonic()
-    for endpoint in endpoints:
-        try:
-            response = session.get(
-                endpoint,
-                proxies=proxies,
-                timeout=(min(4.0, timeout), timeout),
-                headers={"Accept": "application/json", "User-Agent": "GrokRegister/1"},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if endpoint.startswith("https://ipwho.is") and payload.get("success") is False:
-                raise RuntimeError("探测服务拒绝了请求")
-            ip, asn, org = _parse_probe_payload(payload)
-            result = {
-                "ok": True,
-                "exit_ip": ip,
-                "asn": asn,
-                "asn_org": org,
-                "latency_ms": max(1, int((time.monotonic() - started) * 1000)),
-                "checked_at": _utc_now(),
-            }
+    for _family, endpoints in families:
+        family_blocked = False
+        for endpoint in endpoints:
+            try:
+                response = session.get(
+                    endpoint,
+                    proxies=proxies,
+                    timeout=(min(4.0, timeout), timeout),
+                    headers={"Accept": "application/json", "User-Agent": "GrokRegister/1"},
+                )
+                response.raise_for_status()
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = getattr(response, "text", "")
+                if isinstance(payload, dict) and endpoint.startswith("https://ipwho.is") and payload.get("success") is False:
+                    raise RuntimeError("探测服务拒绝了请求")
+                ip, asn, org = _parse_probe_payload(payload)
+                result = {
+                    "ok": True,
+                    "exit_ip": ip,
+                    "asn": asn,
+                    "asn_org": org,
+                    "latency_ms": max(1, int((time.monotonic() - started) * 1000)),
+                    "checked_at": _utc_now(),
+                }
+                break
+            except Exception as exc:
+                last_error = exc
+                if _socks_family_blocked(exc):
+                    family_blocked = True
+                    break
+        if result is not None:
             break
-        except Exception as exc:
-            last_error = exc
     if result is None:
         raise RuntimeError(_probe_error_message(last_error))
     probe_xai_signup(normalized, timeout=timeout)

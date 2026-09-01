@@ -333,6 +333,60 @@ def test_async_probe_job_persists_health():
             proxy_store.probe_proxy = previous_probe
 
 
+def test_parse_probe_payload_accepts_ipv6_json_and_plain_ip():
+    ip, asn, org = proxy_store._parse_probe_payload(
+        {"ip": "2001:db8::9", "org": "AS64500 Example Net"}
+    )
+    assert ip == "2001:db8::9"
+    assert asn == 64500
+    assert "Example" in org
+    ip2, asn2, _org = proxy_store._parse_probe_payload("2001:db8::10\n")
+    assert ip2 == "2001:db8::10"
+    assert asn2 is None
+    assert proxy_store._socks_family_blocked(
+        "SOCKSHTTPSConnectionPool(host='api.ipify.org', port=443): Max retries exceeded with url: /?format=json (Caused by NewConnectionError)"
+    )
+
+
+def test_probe_proxy_falls_back_to_ipv6_after_v4_socks_failure():
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"ip": "2001:db8::8", "org": "AS64500 Example"}
+
+    class FakeSession:
+        trust_env = False
+
+        def get(self, url, **_kwargs):
+            if "v6.ipinfo.io" in url or "api64.ipify.org" in url:
+                return FakeResponse()
+            raise RuntimeError(
+                "SOCKSHTTPSConnectionPool(host='api.ipify.org', port=443): "
+                "Max retries exceeded with url: /?format=json (Caused by NewConnectionError)"
+            )
+
+    class FakeRequests:
+        Session = FakeSession
+
+    previous_requests = sys.modules.get("requests")
+    previous_xai = proxy_store.probe_xai_signup
+    sys.modules["requests"] = FakeRequests()
+    proxy_store.probe_xai_signup = lambda *args, **kwargs: "HTTP 200"
+    try:
+        result = proxy_store.probe_proxy("socks5h://g2a.{account}:token@127.0.0.1:10800")
+        assert result["ok"] is True
+        assert result["exit_ip"] == "2001:db8::8"
+        assert result["asn"] == 64500
+    finally:
+        if previous_requests is None:
+            sys.modules.pop("requests", None)
+        else:
+            sys.modules["requests"] = previous_requests
+        proxy_store.probe_xai_signup = previous_xai
+
+
 if __name__ == "__main__":
     test_sticky_template_normalize_expand_and_probe_identity()
     test_normalize_proxy_formats_and_rejects_paths()
@@ -343,4 +397,6 @@ if __name__ == "__main__":
     test_async_probe_job_persists_health()
     test_home_proxy_risk_stays_usable_and_cannot_disable()
     test_1024_ports_never_enter_worker_pool()
+    test_parse_probe_payload_accepts_ipv6_json_and_plain_ip()
+    test_probe_proxy_falls_back_to_ipv6_after_v4_socks_failure()
     print("OK proxy store")

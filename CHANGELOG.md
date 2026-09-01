@@ -4,6 +4,7 @@
 
 ### Added
 
+- After IPv4 SOCKS failures, the panel proxy-pool health check retries IPv6 IP APIs (`v6.ipinfo.io`, `api64.ipify.org`) so IPv6-only sticky exits are not marked unhealthy.
 - Make iCloud “create now” wait for Apple HME to finish and show created addresses or the Apple rate-limit error, instead of returning before anything happens.
 - iCloud multi-account cookies: inventory lists every alias with its owning Apple account, accounts can be deleted (aliases removed locally and on Apple), auto-create can target selected accounts, and registered aliases can be auto-deleted on an interval/batch/min-age/keep-last policy.
 - Auto-inject `MONITOR_TOKEN` into the live panel when the browser is on loopback (SSH tunnel / 127.0.0.1), so local testing does not require pasting the token.

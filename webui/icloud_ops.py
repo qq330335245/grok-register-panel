@@ -143,11 +143,33 @@ def runtime_snapshot() -> Dict[str, Any]:
 
 
 def request_run_now() -> Dict[str, Any]:
-    return {"ok": True, "runtime": SCHEDULER.request_run_now()}
+    runtime = SCHEDULER.request_run_now(wait=True, timeout=120)
+    inventory = inventory_snapshot()
+    result = runtime.get("last_result") or {}
+    ok = str(runtime.get("last_status") or "") in ("success", "partial")
+    error = str(runtime.get("last_error") or "")
+    return {
+        "ok": ok or not error,
+        "error": None if ok or not error else redact_log_line(error)[:400],
+        "runtime": runtime,
+        "result": result,
+        "inventory": inventory,
+    }
 
 
 def request_delete_now() -> Dict[str, Any]:
-    return {"ok": True, "runtime": DELETE_SCHEDULER.request_run_now()}
+    runtime = DELETE_SCHEDULER.request_run_now(wait=True, timeout=120)
+    inventory = inventory_snapshot()
+    result = runtime.get("last_result") or {}
+    ok = str(runtime.get("last_status") or "") in ("success", "partial")
+    error = str(runtime.get("last_error") or "")
+    return {
+        "ok": ok or not error,
+        "error": None if ok or not error else redact_log_line(error)[:400],
+        "runtime": runtime,
+        "result": result,
+        "inventory": inventory,
+    }
 
 
 def inventory_snapshot() -> Dict[str, Any]:

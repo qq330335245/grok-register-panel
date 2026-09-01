@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
@@ -160,13 +161,38 @@ class ICloudAutoCreateScheduler:
                 )
         return self.snapshot()
 
-    def request_run_now(self) -> Dict[str, Any]:
+    def request_run_now(self, wait: bool = False, timeout: float = 120.0) -> Dict[str, Any]:
+        marker = _utc_now()
         with self._lock:
             self._run_now_requested = True
             if not self._running:
-                self._next_run_at = _utc_now()
+                self._next_run_at = marker
             self._append_log_locked("info", f"已请求立即{self._verb} iCloud 邮箱")
+        if wait:
+            return self.wait_until_idle(timeout=timeout, started_after=marker)
         return self.snapshot()
+
+    def wait_until_idle(
+        self,
+        timeout: float = 120.0,
+        started_after: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        deadline = time.monotonic() + max(float(timeout or 0), 1.0)
+        while time.monotonic() < deadline:
+            with self._lock:
+                running = self._running or self._run_now_requested
+                finished = self._last_finished_at
+            if not running and finished is not None:
+                if started_after is None or finished >= started_after:
+                    return self.snapshot()
+            time.sleep(0.25)
+        snap = self.snapshot()
+        if not snap.get("running") and snap.get("last_finished_at"):
+            return snap
+        snap = dict(snap)
+        snap["last_status"] = snap.get("last_status") or "failed"
+        snap["last_error"] = snap.get("last_error") or f"等待{self._verb}完成超时"
+        return snap
 
     def _run_loop(self) -> None:
         while not self._stop_event.wait(POLL_SECONDS):

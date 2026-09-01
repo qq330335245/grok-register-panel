@@ -3541,23 +3541,37 @@ async function syncIcloudInventory() {
 async function runIcloudCreateNow() {
   const button = document.getElementById("icloud-run-now-button");
   button.disabled = true;
-  setMsg("mail-provider-msg", "已请求立即创建 iCloud 别名...", "");
+  setMsg("mail-provider-msg", "正在向 Apple 创建别名，请稍候…", "");
   try {
     const result = await api("/api/icloud-auto-create/run-now", { method: "POST", body: "{}" });
     renderIcloudRuntime(result.runtime || {});
-    setMsg("mail-provider-msg", "已开始创建一批 iCloud 别名", "ok");
+    if (result.inventory) {
+      renderIcloudInventory(result.inventory);
+      renderIcloudAccounts(result.inventory, result);
+    }
+    const created = Number((result.result || {}).created_count || 0);
+    const emails = ((result.result || {}).emails || []).slice(0, 5).join(", ");
+    if (created > 0) {
+      setMsg("mail-provider-msg", "已新建 " + created + " 个" + (emails ? "：" + emails : ""), "ok");
+    } else {
+      setMsg("mail-provider-msg", (result.runtime && result.runtime.last_error) || "没有新建别名（可能被 Apple 限流）", "err");
+    }
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
   button.disabled = false;
 }
 async function runIcloudDeleteNow() {
   const button = document.getElementById("icloud-delete-now-button");
   button.disabled = true;
-  setMsg("mail-provider-msg", "已请求立即删除已注册别名...", "");
+  setMsg("mail-provider-msg", "正在删除已注册别名，请稍候…", "");
   try {
     const result = await api("/api/icloud-auto-delete/run-now", { method: "POST", body: "{}" });
     renderIcloudRuntime(result.runtime || {});
-    setMsg("mail-provider-msg", "已开始删除一批已注册别名", "ok");
-    refreshIcloudOps();
+    if (result.inventory) {
+      renderIcloudInventory(result.inventory);
+      renderIcloudAccounts(result.inventory, result);
+    }
+    const deleted = Number((result.result || {}).deleted_count || 0);
+    setMsg("mail-provider-msg", deleted > 0 ? ("已删除 " + deleted + " 个已注册别名") : ((result.runtime && result.runtime.last_error) || "没有删除别名"), deleted > 0 ? "ok" : "err");
   } catch (e) { setMsg("mail-provider-msg", String(e.message || e), "err"); }
   button.disabled = false;
 }

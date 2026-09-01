@@ -26,7 +26,7 @@ class ICloudAutoCreateSchedulerTests(unittest.TestCase):
             return {"created_count": count, "failed_count": 0, "emails": ["a@icloud.com", "b@icloud.com"]}
 
         scheduler = ICloudAutoCreateScheduler(lambda: config, create_batch)
-        scheduler.request_run_now()
+        scheduler.request_run_now(wait=False)
         scheduler.tick()
 
         self.assertTrue(completed.wait(1))
@@ -35,6 +35,26 @@ class ICloudAutoCreateSchedulerTests(unittest.TestCase):
         self.assertEqual(snapshot["today_total_records"], 2)
         self.assertEqual(len(snapshot["recent_success_records"]), 2)
         self.assertIsNone(snapshot["next_run_at"])
+
+    def test_request_run_now_wait_returns_result(self):
+        config = {
+            "icloud_auto_create_enabled": False,
+            "icloud_auto_create_interval_minutes": 60,
+            "icloud_auto_create_batch_size": 1,
+        }
+
+        def create_batch(count, log):
+            log("wait-create")
+            return {"created_count": 1, "failed_count": 0, "emails": ["wait@icloud.com"]}
+
+        scheduler = ICloudAutoCreateScheduler(lambda: config, create_batch)
+        scheduler.start()
+        try:
+            snapshot = scheduler.request_run_now(wait=True, timeout=5)
+        finally:
+            scheduler.shutdown()
+        self.assertEqual(snapshot["last_status"], "success")
+        self.assertEqual(snapshot["last_result"]["created_count"], 1)
 
     def test_notify_clamps_schedule_values(self):
         config = {

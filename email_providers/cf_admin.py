@@ -20,7 +20,33 @@ from email_providers.common import extract_verification_code, generate_username,
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
 
-ADMIN_MAIL_LIMITS: Tuple[int, ...] = (50, 40, 30, 20, 10, 5, 1)
+MAIL_LIST_LIMIT = 5
+DEFAULT_POLL_INTERVAL = 8.0
+MAX_POLL_INTERVAL = 12.0
+ADMIN_MAIL_LIMITS: Tuple[int, ...] = (5, 1)
+
+
+def mail_has_body(mail: dict) -> bool:
+    if not isinstance(mail, dict):
+        return False
+    for field in ("raw", "text", "content", "body", "snippet", "intro"):
+        if str(mail.get(field) or "").strip():
+            return True
+    html = mail.get("html")
+    if isinstance(html, str) and html.strip():
+        return True
+    if isinstance(html, list) and any(str(item or "").strip() for item in html):
+        return True
+    return False
+
+
+def next_poll_sleep(poll_interval: float, round_index: int = 0) -> float:
+    base = max(float(poll_interval or DEFAULT_POLL_INTERVAL), 1.0)
+    try:
+        step = max(0, int(round_index))
+    except Exception:
+        step = 0
+    return min(MAX_POLL_INTERVAL, base * (1.35 ** step))
 
 
 
@@ -172,7 +198,7 @@ def list_user_mails(
     *,
     messages_path: str = "/api/mails",
     custom_auth: str = "",
-    limit: int = 50,
+    limit: int = MAIL_LIST_LIMIT,
     offset: int = 0,
 ) -> List[dict]:
     base = str(api_base or "").rstrip("/")
@@ -180,34 +206,19 @@ def list_user_mails(
     if not base or not token:
         return []
     path = normalize_path(messages_path, "/api/mails")
-    attempts = [
-        (path, user_headers(token, custom_auth=custom_auth, mode="bearer")),
-        ("/user_api/mails", user_headers(token, custom_auth=custom_auth, mode="x-user-token")),
-    ]
-    # Avoid duplicate path when messages_path already is /user_api/mails
-    seen = set()
-    errors: List[str] = []
-    for attempt_path, headers in attempts:
-        if attempt_path in seen:
-            continue
-        seen.add(attempt_path)
-        url = f"{base}{attempt_path}"
-        try:
-            resp = http_get(
-                url,
-                headers=headers,
-                params={"limit": max(1, int(limit)), "offset": max(0, int(offset))},
-            )
-            if getattr(resp, "status_code", 0) >= 400:
-                errors.append(f"{attempt_path} HTTP {resp.status_code}")
-                continue
-            return _extract_mails(resp.json())
-        except Exception as exc:
-            errors.append(f"{attempt_path}: {exc}")
-            continue
-    if errors:
-        raise Exception("cf_admin 用户邮件接口失败: " + " | ".join(errors[:3]))
-    return []
+    mode = "x-user-token" if path.rstrip("/").lower() == "/user_api/mails" else "bearer"
+    headers = user_headers(token, custom_auth=custom_auth, mode=mode)
+    url = f"{base}{path}"
+    resp = http_get(
+        url,
+        headers=headers,
+        params={"limit": max(1, int(limit)), "offset": max(0, int(offset))},
+    )
+    if getattr(resp, "status_code", 0) >= 400:
+        raise Exception(
+            f"cf_admin 用户邮件接口失败: {path} HTTP {resp.status_code}"
+        )
+    return _extract_mails(resp.json())
 
 
 def list_admin_mails(
@@ -218,7 +229,7 @@ def list_admin_mails(
     custom_auth: str = "",
     admin_mails_path: str = "/admin/mails",
     address: str = "",
-    preferred_limit: int = 20,
+    preferred_limit: int = MAIL_LIST_LIMIT,
     offset: int = 0,
 ) -> List[dict]:
     base = str(api_base or "").rstrip("/")
@@ -285,6 +296,7 @@ def check_health(
             custom_auth=custom_auth,
             admin_mails_path=admin_mails_path,
             preferred_limit=1,
+            offset=1,
         )
         return True, f"admin mails OK ({base})"
     except Exception as exc:
@@ -302,7 +314,7 @@ def wait_for_code(
     messages_path: str = "/api/mails",
     admin_mails_path: str = "/admin/mails",
     timeout: float = 180,
-    poll_interval: float = 3,
+    poll_interval: float = DEFAULT_POLL_INTERVAL,
     log_callback: Optional[Callable[[str], None]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
     resend_callback: Optional[Callable[[], None]] = None,
@@ -313,6 +325,7 @@ def wait_for_code(
     seen_attempts: Dict[str, int] = {}
     next_resend_at = time.time() + 35
     target = str(email or "").strip()
+    round_index = 0
 
     def _raise_if_cancelled() -> None:
         if raise_if_cancelled is not None:
@@ -355,7 +368,8 @@ def wait_for_code(
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] cf_admin 拉取邮件失败: {exc}")
-            _sleep(poll_interval)
+            _sleep(next_poll_sleep(poll_interval, round_index))
+            round_index += 1
             continue
         if log_callback:
             log_callback(f"[Debug] cf_admin 本轮邮件数量: {len(messages)}")
@@ -375,29 +389,31 @@ def wait_for_code(
             if attempt >= 5:
                 continue
             seen_attempts[key] = attempt + 1
-            if target and not mail_matches_address(msg, target):
+            addr = str(msg.get("address") or "").lower()
+            if target and addr != target.lower() and not mail_matches_address(msg, target):
                 if log_callback:
                     log_callback(
                         f"[Debug] cf_admin 跳过非目标邮件 id={msg_id} target={target}"
                     )
                 continue
             combined, subject = combine_mail_text(msg)
-            detail = get_mail_detail(
-                http_get,
-                api_base,
-                msg_id,
-                jwt=jwt,
-                admin_password=admin_password,
-                custom_auth=custom_auth,
-                messages_path=messages_path,
-                admin_mails_path=admin_mails_path,
-            )
-            if detail:
-                extra, detail_subject = combine_mail_text(detail)
-                if extra:
-                    combined = (combined + "\n" + extra).strip()
-                if not subject and detail_subject:
-                    subject = detail_subject
+            if msg_id and not mail_has_body(msg):
+                detail = get_mail_detail(
+                    http_get,
+                    api_base,
+                    msg_id,
+                    jwt=jwt,
+                    admin_password=admin_password,
+                    custom_auth=custom_auth,
+                    messages_path=messages_path,
+                    admin_mails_path=admin_mails_path,
+                )
+                if detail:
+                    extra, detail_subject = combine_mail_text(detail)
+                    if extra:
+                        combined = (combined + "\n" + extra).strip()
+                    if not subject and detail_subject:
+                        subject = detail_subject
             if log_callback:
                 log_callback(f"[Debug] cf_admin 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
@@ -409,7 +425,8 @@ def wait_for_code(
                 log_callback(
                     f"[Debug] cf_admin 邮件未提取到验证码 id={msg_id} attempt={attempt + 1}"
                 )
-        _sleep(poll_interval)
+        _sleep(next_poll_sleep(poll_interval, round_index))
+        round_index += 1
     raise Exception(f"cf_admin 在 {int(timeout)}s 内未收到验证码邮件")
 
 def _decode_mime_header(value: Any) -> str:
@@ -601,7 +618,7 @@ def list_forward_mailbox_mails(
     admin_password: str = "",
     custom_auth: str = "",
     admin_mails_path: str = "/admin/mails",
-    preferred_limit: int = 40,
+    preferred_limit: int = MAIL_LIST_LIMIT,
 ) -> List[dict]:
     forward = str(forward_email or "").strip().lower()
     if not forward or not admin_password:
@@ -662,7 +679,7 @@ def list_messages_for_icloud_alias(
                     custom_auth=custom_auth,
                     admin_mails_path=admin_mails_path,
                     address=alias,
-                    preferred_limit=40,
+                    preferred_limit=MAIL_LIST_LIMIT,
                 )
                 mails = [m for m in mails if isinstance(m, dict)]
             except Exception:
@@ -775,50 +792,50 @@ def list_messages(
     messages_path: str = "/api/mails",
     admin_mails_path: str = "/admin/mails",
 ) -> List[dict]:
-    """Fetch mails: JWT first, then admin filtered, then admin unfiltered+client filter."""
+    """JWT first; empty inbox is success. Admin is address-filtered.
+
+    Unfiltered /admin/mails (full-table COUNT) is only used when there is
+    no JWT and no target address.
+    """
     errors: List[str] = []
     if jwt:
         try:
-            mails = list_user_mails(
+            return list_user_mails(
                 http_get,
                 api_base,
                 jwt,
                 messages_path=messages_path,
                 custom_auth=custom_auth,
+                limit=MAIL_LIST_LIMIT,
             )
-            if mails:
-                return mails
         except Exception as exc:
             errors.append(str(exc))
 
-    if admin_password:
-        if target_email:
-            try:
-                mails = list_admin_mails(
-                    http_get,
-                    api_base,
-                    admin_password=admin_password,
-                    custom_auth=custom_auth,
-                    admin_mails_path=admin_mails_path,
-                    address=target_email,
-                )
-                if mails:
-                    return mails
-            except Exception as exc:
-                errors.append(str(exc))
+    if admin_password and target_email:
         try:
-            mails = list_admin_mails(
+            return list_admin_mails(
+                http_get,
+                api_base,
+                admin_password=admin_password,
+                custom_auth=custom_auth,
+                admin_mails_path=admin_mails_path,
+                address=target_email,
+                preferred_limit=MAIL_LIST_LIMIT,
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+
+    if admin_password and not target_email:
+        try:
+            return list_admin_mails(
                 http_get,
                 api_base,
                 admin_password=admin_password,
                 custom_auth=custom_auth,
                 admin_mails_path=admin_mails_path,
                 address="",
+                preferred_limit=MAIL_LIST_LIMIT,
             )
-            if target_email:
-                filtered = [m for m in mails if mail_matches_address(m, target_email)]
-                return filtered if filtered else mails
-            return mails
         except Exception as exc:
             errors.append(str(exc))
 

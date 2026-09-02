@@ -561,7 +561,7 @@ def wait_for_verification_code(
     temp_mail_custom_auth: str = "",
     http_get: Optional[HttpGet] = None,
     timeout: int = 180,
-    poll_interval: float = 3.0,
+    poll_interval: float = 8.0,
     log_callback: LogFn = None,
     cancel_callback: CancelCb = None,
     exclude_codes: Optional[Set[str]] = None,
@@ -609,7 +609,8 @@ def wait_for_verification_code(
         raw_mails: List[dict] = []
         fetch_error = ""
         try:
-            # Unfiltered forward inbox first (for accurate diagnostics).
+            # Address-filtered forward inbox. Empty result means no mail yet;
+            # do not also query the alias (second COUNT on D1).
             raw_mails = cf_admin_provider.list_forward_mailbox_mails(
                 http_get,
                 base,
@@ -617,26 +618,25 @@ def wait_for_verification_code(
                 admin_password=password,
                 custom_auth=custom_auth,
             )
-            if not raw_mails:
-                # Some workers index by alias address as well.
-                try:
-                    raw_mails = cf_admin_provider.list_admin_mails(
-                        http_get,
-                        base,
-                        admin_password=password,
-                        custom_auth=custom_auth,
-                        address=alias,
-                        preferred_limit=40,
-                    )
-                    raw_mails = [m for m in raw_mails if isinstance(m, dict)]
-                except Exception:
-                    raw_mails = []
         except Exception as exc:
             fetch_error = str(exc)
             if poll == 1 or poll % 4 == 1:
                 _log(f"[Debug] iCloud temp_mail 拉信失败: {exc}")
-            _sleep(poll_interval, cancel_callback)
-            continue
+            try:
+                raw_mails = cf_admin_provider.list_admin_mails(
+                    http_get,
+                    base,
+                    admin_password=password,
+                    custom_auth=custom_auth,
+                    address=alias,
+                    preferred_limit=cf_admin_provider.MAIL_LIST_LIMIT,
+                )
+                raw_mails = [m for m in raw_mails if isinstance(m, dict)]
+            except Exception:
+                raw_mails = []
+            if not raw_mails:
+                _sleep(cf_admin_provider.next_poll_sleep(poll_interval, poll - 1), cancel_callback)
+                continue
 
         raw_mails = [m for m in raw_mails if isinstance(m, dict)]
         # List endpoints sometimes omit raw; enrich a few newest mails so HME can match.
@@ -690,7 +690,7 @@ def wait_for_verification_code(
                     f"(已等{int(time.time() - wait_start)}s)"
                 )
                 last_status = status
-            _sleep(poll_interval, cancel_callback)
+            _sleep(cf_admin_provider.next_poll_sleep(poll_interval, poll - 1), cancel_callback)
             continue
 
         matched = [m for m in raw_mails if cf_admin_provider.mail_targets_hme_alias(m, alias)]
@@ -704,7 +704,7 @@ def wait_for_verification_code(
                 )
                 _log(f"[Debug] TempMail 最近信件: {snap}")
                 last_status = status
-            _sleep(poll_interval, cancel_callback)
+            _sleep(cf_admin_provider.next_poll_sleep(poll_interval, poll - 1), cancel_callback)
             continue
 
         # newest first
@@ -786,7 +786,7 @@ def wait_for_verification_code(
                 f"{_snapshot_forward_mails(matched, alias=alias, limit=5)}"
             )
             last_status = status
-        _sleep(poll_interval, cancel_callback)
+        _sleep(cf_admin_provider.next_poll_sleep(poll_interval, poll - 1), cancel_callback)
 
     # Final diagnostic snapshot (still no increase of timeout).
     try:

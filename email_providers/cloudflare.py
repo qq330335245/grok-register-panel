@@ -9,6 +9,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from email_providers.common import extract_verification_code, generate_username, pick_list_payload, random_subdomain_domain
+from email_providers.cf_admin import MAIL_LIST_LIMIT, mail_has_body, next_poll_sleep
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
@@ -247,7 +248,7 @@ def get_messages(
 ) -> List[dict]:
     headers = apply_custom_auth({"Authorization": f"Bearer {token}"}, custom_auth)
     path = messages_path if messages_path.startswith("/") else f"/{messages_path}"
-    params = apply_auth_params({"limit": 20, "offset": 0}, api_key, auth_mode)
+    params = apply_auth_params({"limit": MAIL_LIST_LIMIT, "offset": 0}, api_key, auth_mode)
     resp = http_get(f"{api_base.rstrip('/')}{path}", headers=headers, params=params)
     resp.raise_for_status()
     try:
@@ -378,7 +379,7 @@ def wait_for_code(
     auth_mode: str = "none",
     custom_auth: str = "",
     timeout: int = 180,
-    poll_interval: int = 3,
+    poll_interval: int = 8,
     raise_if_cancelled: Callable[[Optional[Callable[[], bool]]], None],
     sleep_with_cancel: Callable[[float, Optional[Callable[[], bool]]], None],
     log_callback: Optional[Callable[[str], None]] = None,
@@ -390,6 +391,7 @@ def wait_for_code(
     deadline = time.time() + timeout
     seen_attempts = {}
     next_resend_at = time.time() + 35
+    round_index = 0
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         if resend_callback and time.time() >= next_resend_at:
@@ -414,7 +416,8 @@ def wait_for_code(
         except Exception as exc:
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 拉取邮件列表失败: {exc}")
-            sleep_with_cancel(poll_interval, cancel_callback)
+            sleep_with_cancel(next_poll_sleep(poll_interval, round_index), cancel_callback)
+            round_index += 1
             continue
         if log_callback:
             log_callback(f"[Debug] Cloudflare 本轮邮件数量: {len(messages)}")
@@ -450,31 +453,32 @@ def wait_for_code(
                 parts.append(re.sub(r"<[^>]+>", " ", h))
             subject = str(msg.get("subject", "") or "")
             combined = "\n".join(parts)
-            try:
-                detail = get_message_detail(
-                    http_get,
-                    api_base,
-                    dev_token,
-                    msg_id,
-                    messages_path=messages_path,
-                    api_key=api_key,
-                    auth_mode=auth_mode,
-                    custom_auth=custom_auth,
-                )
-                for field in ("text", "raw", "content", "intro", "body", "snippet"):
-                    value = detail.get(field)
-                    if isinstance(value, str) and value.strip():
-                        combined += "\n" + value
-                html_list2 = detail.get("html") or []
-                if isinstance(html_list2, str):
-                    html_list2 = [html_list2]
-                for h in html_list2:
-                    combined += "\n" + re.sub(r"<[^>]+>", " ", h)
-                if not subject:
-                    subject = str(detail.get("subject", "") or "")
-            except Exception as exc:
-                if log_callback:
-                    log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
+            if not mail_has_body(msg):
+                try:
+                    detail = get_message_detail(
+                        http_get,
+                        api_base,
+                        dev_token,
+                        msg_id,
+                        messages_path=messages_path,
+                        api_key=api_key,
+                        auth_mode=auth_mode,
+                        custom_auth=custom_auth,
+                    )
+                    for field in ("text", "raw", "content", "intro", "body", "snippet"):
+                        value = detail.get(field)
+                        if isinstance(value, str) and value.strip():
+                            combined += "\n" + value
+                    html_list2 = detail.get("html") or []
+                    if isinstance(html_list2, str):
+                        html_list2 = [html_list2]
+                    for h in html_list2:
+                        combined += "\n" + re.sub(r"<[^>]+>", " ", h)
+                    if not subject:
+                        subject = str(detail.get("subject", "") or "")
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] Cloudflare detail接口失败，改用列表内容解析: {exc}")
             if log_callback:
                 log_callback(f"[Debug] Cloudflare 收到邮件: {subject}")
             code = extract_verification_code(combined, subject)
@@ -486,5 +490,6 @@ def wait_for_code(
                 log_callback(
                     f"[Debug] 邮件已解析但未提取到验证码 id={msg_id} attempt={seen_attempts[msg_id]}"
                 )
-        sleep_with_cancel(poll_interval, cancel_callback)
+        sleep_with_cancel(next_poll_sleep(poll_interval, round_index), cancel_callback)
+        round_index += 1
     raise Exception(f"Cloudflare 在 {timeout}s 内未收到验证码邮件")

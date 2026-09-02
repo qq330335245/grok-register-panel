@@ -213,7 +213,7 @@ def list_user_mails(
     resp = http_get(
         url,
         headers=headers,
-        params={"limit": max(1, int(limit)), "offset": max(0, int(offset))},
+        params={"limit": max(1, int(limit)), "offset": max(0, int(offset)), "skipCount": 1},
     )
     if getattr(resp, "status_code", 0) >= 400:
         raise Exception(
@@ -251,7 +251,7 @@ def list_admin_mails(
 
     last_error = ""
     for limit in limits:
-        params: Dict[str, Any] = {"limit": limit, "offset": max(0, int(offset))}
+        params: Dict[str, Any] = {"limit": limit, "offset": max(0, int(offset)), "skipCount": 1}
         if address:
             params["address"] = address
         try:

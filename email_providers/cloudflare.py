@@ -248,7 +248,7 @@ def get_messages(
 ) -> List[dict]:
     headers = apply_custom_auth({"Authorization": f"Bearer {token}"}, custom_auth)
     path = messages_path if messages_path.startswith("/") else f"/{messages_path}"
-    params = apply_auth_params({"limit": MAIL_LIST_LIMIT, "offset": 0}, api_key, auth_mode)
+    params = apply_auth_params({"limit": MAIL_LIST_LIMIT, "offset": 0, "skipCount": 1}, api_key, auth_mode)
     resp = http_get(f"{api_base.rstrip('/')}{path}", headers=headers, params=params)
     resp.raise_for_status()
     try:

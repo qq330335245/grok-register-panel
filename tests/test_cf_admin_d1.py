@@ -78,6 +78,38 @@ def test_jwt_401_uses_filtered_admin_not_unfiltered():
     assert all("/user_api/mails" not in item[0] for item in calls)
 
 
+def test_forward_mailbox_uses_larger_limit():
+    calls = []
+
+    def http_get(url, headers=None, params=None):
+        calls.append(dict(params or {}))
+        return FakeResponse(200, {"results": []})
+
+    cf_admin.list_forward_mailbox_mails(
+        http_get,
+        "https://mail.test",
+        forward_email="fwd@mail.test",
+        admin_password="secret",
+    )
+    assert int(calls[0]["limit"]) == cf_admin.FORWARD_MAIL_LIST_LIMIT
+    assert calls[0]["address"] == "fwd@mail.test"
+
+    unique = []
+
+    def http_get_unique(url, headers=None, params=None):
+        unique.append(dict(params or {}))
+        return FakeResponse(200, {"results": []})
+
+    cf_admin.list_messages(
+        http_get_unique,
+        "https://mail.test",
+        jwt="tok",
+        admin_password="secret",
+        target_email="user@mail.test",
+    )
+    assert int(unique[0]["limit"]) == cf_admin.MAIL_LIST_LIMIT
+
+
 def test_list_user_mails_does_not_probe_user_api():
     calls = []
 
@@ -220,6 +252,7 @@ if __name__ == "__main__":
     test_mail_has_body_and_backoff()
     test_jwt_empty_inbox_does_not_hit_admin()
     test_jwt_401_uses_filtered_admin_not_unfiltered()
+    test_forward_mailbox_uses_larger_limit()
     test_list_user_mails_does_not_probe_user_api()
     test_health_check_skips_full_count()
     test_wait_for_code_skips_detail_when_raw_present()

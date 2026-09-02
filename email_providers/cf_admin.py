@@ -21,6 +21,7 @@ HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
 
 MAIL_LIST_LIMIT = 5
+FORWARD_MAIL_LIST_LIMIT = 40
 DEFAULT_POLL_INTERVAL = 8.0
 MAX_POLL_INTERVAL = 12.0
 ADMIN_MAIL_LIMITS: Tuple[int, ...] = (5, 1)
@@ -618,7 +619,7 @@ def list_forward_mailbox_mails(
     admin_password: str = "",
     custom_auth: str = "",
     admin_mails_path: str = "/admin/mails",
-    preferred_limit: int = MAIL_LIST_LIMIT,
+    preferred_limit: int = FORWARD_MAIL_LIST_LIMIT,
 ) -> List[dict]:
     forward = str(forward_email or "").strip().lower()
     if not forward or not admin_password:

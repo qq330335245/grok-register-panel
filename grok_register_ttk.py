@@ -26,6 +26,11 @@ import base64
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
+from runtime_platform import apply_playwright_node_env, apply_runtime_tmpdir
+
+apply_runtime_tmpdir()
+apply_playwright_node_env()
+
 from playwright._impl._errors import TargetClosedError as PageDisconnectedError
 from curl_cffi import requests
 import requests as _std_requests
@@ -52,6 +57,14 @@ import connectivity as _conn
 from batch_supervisor import mark_slot_completed
 from batch_traffic import mark_successful_account
 from retry_policy import proxy_boot_rotations, slot_retries
+from risk_breaker import (
+    apply_risk_breaker_wait,
+    note_risk_failure,
+    note_risk_success,
+    reset_risk_breaker,
+    risk_breaker_should_stop,
+)
+from build_bot_risk import inspect_build_bot_risk
 from secure_files import (
     append_private_text,
     atomic_write_json,
@@ -243,6 +256,8 @@ DEFAULT_CONFIG = {
     "grok2api_upload_retries": 3,
     "grok2api_upload_retry_delay_s": 2.0,
     "grok2api_upload_pending_file": "grok2api_upload_pending.json",
+    # 风控探测未完成（unknown）时是否仍上传 CPA/grok2api
+    "upload_when_risk_unknown": True,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -290,7 +305,7 @@ DEFAULT_CONFIG = {
     "icloud_fail_cooldown_max_sec": 86400,
     "icloud_fail_cooldown_threshold": 3,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
-    "account_interval": "60-120",
+    "account_interval": "0",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -427,8 +442,15 @@ def record_register_result(
     try:
         if status == "ok":
             _record_managed_proxy_result(proxy, "success")
+            note_risk_success()
         elif status == "risk" or kind == FAIL_RISK:
             _record_managed_proxy_result(proxy, "risk", detail)
+            action, wait_s, streak = note_risk_failure()
+            if log_callback and action != "ok":
+                if action == "stop":
+                    log_callback(f"[风控] 连续{streak}次风控，停止注册流程")
+                elif action == "wait":
+                    log_callback(f"[风控] 连续{streak}次风控，暂停{int(wait_s)}s 后再试")
         elif kind == FAIL_BROWSER:
             _record_managed_proxy_result(proxy, "network", detail)
     except Exception:
@@ -754,6 +776,10 @@ def get_thread_proxy() -> str:
     return str(getattr(_proxy_tls, "proxy", "") or "").strip()
 
 
+def get_thread_proxy_template() -> str:
+    return str(getattr(_proxy_tls, "template", "") or get_thread_proxy() or "").strip()
+
+
 def _stash_mailbox(email, token) -> None:
     _mailbox_tls.pending = (email, token)
 
@@ -801,6 +827,8 @@ def _mailbox_or_proxy_error_prefix(exc: object) -> str:
 def assign_worker_proxy(worker_id: int, rotate_idx: int = 0, log_callback=None) -> str:
     """Pick a pool node and expand grok2api-style {account}/{email}/{id} templates."""
     template = pick_proxy_for_worker(worker_id, rotate_idx)
+    _proxy_tls.template = template
+    _proxy_tls.sticky = _is_sticky_template(template)
     if not _is_sticky_template(template):
         set_thread_proxy(template)
         if log_callback:
@@ -1210,8 +1238,79 @@ def _registration_risk_should_block(state: dict) -> tuple:
     return False, ""
 
 
+def _cache_build_token(token: dict | None) -> None:
+    _proxy_tls.build_token = token if isinstance(token, dict) else None
+
+
+def _take_cached_build_token() -> dict | None:
+    token = getattr(_proxy_tls, "build_token", None)
+    _proxy_tls.build_token = None
+    return token if isinstance(token, dict) else None
+
+
+def _stash_risk_state(state: dict | None) -> None:
+    _proxy_tls.risk_state = dict(state or {})
+
+
+def _raise_build_bot_risk(email: str, sso: str, info: dict, log_callback=None) -> None:
+    source = int(info.get("source") or 2)
+    details = str(info.get("reason") or "no thinking on sticky exits")
+    _stash_risk_state(
+        {
+            "found": True,
+            "flagged": True,
+            "bot_flag_source": source,
+            "reason": details,
+        }
+    )
+    try:
+        from webui.account_store import RISK_FLAGGED, upsert_account
+        from datetime import timezone as _tz
+
+        upsert_account(
+            email,
+            sso=sso,
+            risk_status=RISK_FLAGGED,
+            risk_detail=details,
+            risk_checked_at=datetime.datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            uploaded=False,
+            upload_skipped=True,
+        )
+    except Exception:
+        pass
+    _append_sso_risk_rejected(email, sso, details, log_callback=log_callback)
+    try:
+        record_register_result(
+            "risk",
+            email or "",
+            kind=FAIL_RISK,
+            detail=f"bot_flag_source={source} {details}",
+            bot_flag=source,
+            log_callback=log_callback,
+        )
+    except Exception:
+        pass
+    raise RegistrationRiskDenied(
+        "注册风控拒绝，已跳过 OAuth: "
+        f"bot_flag_source={source} {details}"
+    )
+
+
+def _run_build_thinking_probe(access_token: str, email="", log_callback=None) -> dict:
+    def _risk_log(message):
+        if log_callback:
+            log_callback(str(message).strip())
+
+    return inspect_build_bot_risk(
+        access_token,
+        email=str(email or ""),
+        proxy_template=get_thread_proxy_template(),
+        log=_risk_log,
+    )
+
+
 def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
-    """检查新账号风控状态；命中时保存 SSO 到隔离文件并终止正常入库。"""
+    """用 grok2api 同款 Build 对话探测降智；命中时隔离 SSO 并终止入库。"""
     sso = _normalize_sso_token(raw_token)
     if not sso:
         raise RegistrationRiskDenied("注册风控检查失败: sso 为空")
@@ -1220,45 +1319,106 @@ def ensure_sso_oauth_eligible(raw_token, email="", log_callback=None) -> dict:
         if log_callback:
             log_callback(f"[风控] {str(message).strip()}")
 
-    _risk_log("检查新账号注册风控状态 ...")
-    state = _s2cpa.inspect_sso_account_state(
-        sso,
-        proxy=_resolve_cpa_proxy(),
-        log=_risk_log,
-    )
-    block, details = _registration_risk_should_block(state)
-    if block:
-        details = str(details or state.get("bot_flag_details") or "registration_risk")
-        _append_sso_risk_rejected(email, sso, details, log_callback=log_callback)
-        try:
-            _bf = state.get("bot_flag_source")
-            _rk = None
-            _mrisk = re.search(r"risk=([\d.]+)", str(details))
-            if _mrisk:
-                try:
-                    _rk = float(_mrisk.group(1))
-                except Exception:
-                    _rk = None
-            record_register_result(
-                "risk",
-                email or "",
-                kind=FAIL_RISK,
-                detail=f"botFlagSource={_bf} {details}",
-                bot_flag=_bf,
-                risk=_rk,
-                log_callback=log_callback,
-            )
-        except Exception:
-            pass
-        raise RegistrationRiskDenied(
-            "注册风控拒绝，已跳过 OAuth: "
-            f"botFlagSource={state.get('bot_flag_source')} {details}"
+    _risk_log("用 Build 对话检测降智（grok2api 同款，非 JWT / grok.com 页面）...")
+    proxy = _resolve_cpa_proxy()
+    try:
+        token = _s2cpa.sso_to_token(
+            sso,
+            proxy=proxy,
+            log=_risk_log,
+            prefer="device",
+            allow_fallback=True,
+            browser_approve=None,
         )
-    if not state.get("found"):
-        _risk_log(f"未读取到注册风控字段，继续 OAuth: {state.get('error') or 'unknown'}")
-    elif state.get("bot_flag_source") == 0:
-        _risk_log("注册风控状态可用: botFlagSource=0")
-    return state
+    except Exception as exc:
+        _risk_log(f"换 token 失败，跳过对话检测: {redact_sensitive_log_line(str(exc))}")
+        return {"found": False, "bot_flag_source": None, "error": str(exc)[:200]}
+    if not token or not str(token.get("access_token") or "").strip():
+        _risk_log("换 token 失败，跳过对话检测")
+        return {"found": False, "bot_flag_source": None, "error": "sso_to_token_failed"}
+    _cache_build_token(token)
+    try:
+        from build_bot_risk import BOT_RISK_TOKEN_READY_SECONDS
+
+        wait_s = float(BOT_RISK_TOKEN_READY_SECONDS or 0)
+    except Exception:
+        wait_s = 4.0
+    if wait_s > 0:
+        _risk_log(f"token 刚签发，等待 {wait_s:.0f}s 再打 Build 对话")
+        time.sleep(wait_s)
+    info = _run_build_thinking_probe(
+        str(token.get("access_token") or ""),
+        email=email,
+        log_callback=log_callback,
+    )
+    _proxy_tls.bot_risk_checked = True
+    if info.get("flagged"):
+        _raise_build_bot_risk(email, sso, info, log_callback=log_callback)
+    if not info.get("ok"):
+        reason = str(info.get("reason") or "probe_failed")
+        _stash_risk_state(
+            {"found": False, "flagged": False, "bot_flag_source": None, "reason": reason}
+        )
+        _risk_log(f"Build 对话检测未完成: {reason}")
+        return {
+            "found": False,
+            "bot_flag_source": None,
+            "error": reason,
+        }
+    reason = str(info.get("reason") or "thinking")
+    _stash_risk_state(
+        {"found": True, "flagged": False, "bot_flag_source": 0, "reason": reason}
+    )
+    _risk_log(f"Build 对话有思考，风控状态可用 ({reason})")
+    return {
+        "found": True,
+        "bot_flag_source": 0,
+        "bot_flag_details": reason,
+        "denied": False,
+        "policy": "",
+        "event": "",
+    }
+
+
+def finish_account_delivery(email: str, password: str = "", sso: str = "", log_callback=None) -> bool:
+    """Persist registry row and upload unless unknown-risk upload is disabled."""
+    from webui.account_store import RISK_CLEAN, RISK_UNKNOWN, upsert_account
+    from datetime import timezone as _tz
+
+    state = dict(getattr(_proxy_tls, "risk_state", None) or {})
+    unknown = not bool(state.get("found"))
+    risk = RISK_UNKNOWN if unknown else RISK_CLEAN
+    now = datetime.datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    allow_unknown = bool(config.get("upload_when_risk_unknown", True))
+    if unknown and not allow_unknown:
+        upsert_account(
+            email,
+            password=password,
+            sso=sso,
+            risk_status=risk,
+            risk_detail=str(state.get("reason") or "unknown"),
+            risk_checked_at=now,
+            uploaded=False,
+            upload_skipped=True,
+        )
+        if log_callback:
+            log_callback("[*] 风控未确认，已跳过上传（upload_when_risk_unknown=关）")
+        return False
+    ok = add_sso_to_cpa(sso, email=email, log_callback=log_callback)
+    upsert_account(
+        email,
+        password=password,
+        sso=sso,
+        risk_status=risk,
+        risk_detail=str(state.get("reason") or ""),
+        risk_checked_at=now,
+        uploaded=bool(ok),
+        uploaded_web=bool(config.get("grok2api_upload_web")),
+        uploaded_build=bool(config.get("grok2api_auto_upload")),
+        uploaded_console=bool(config.get("grok2api_upload_console")),
+        upload_skipped=False,
+    )
+    return bool(ok)
 
 
 def _upload_grok2api_accounts(token, sso="", email="", log_callback=None) -> bool:
@@ -1384,6 +1544,8 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
     返回 True 表示入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
     """
     if not config.get("cpa_auto_add", False):
+        _take_cached_build_token()
+        _proxy_tls.bot_risk_checked = False
         if log_callback:
             log_callback("[*] 已关闭 SSO→auth，仅保存 SSO（不写 auth）")
         return True
@@ -1455,63 +1617,41 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
         prefer = "auth_code" if token_mode == "auth_code" else "device"
         browser_cb = _browser_approve if use_browser else None
 
-        token = _s2cpa.sso_to_token(
-            sso,
-            proxy=proxy,
-            log=_cpa_log,
-            prefer=prefer,
-            allow_fallback=True,
-            browser_approve=browser_cb,
-        )
+        cached = _take_cached_build_token()
+        already_probed = bool(getattr(_proxy_tls, "bot_risk_checked", False))
+        _proxy_tls.bot_risk_checked = False
+        if cached:
+            token = cached
+            _cpa_log("复用风控检测已换出的 Build token")
+        else:
+            token = _s2cpa.sso_to_token(
+                sso,
+                proxy=proxy,
+                log=_cpa_log,
+                prefer=prefer,
+                allow_fallback=True,
+                browser_approve=browser_cb,
+            )
         if not token:
             _cpa_log("换 token 失败；SSO 已在 accounts 文件，稍后可重转")
             _append_sso_pending(email, sso, log_callback=log_callback)
             return False
+        if not already_probed:
+            info = _run_build_thinking_probe(
+                str(token.get("access_token") or ""),
+                email=email,
+                log_callback=log_callback,
+            )
+            if info.get("flagged"):
+                _raise_build_bot_risk(email, sso, info, log_callback=log_callback)
 
-        # JWT bfs 检测（与 botFlagSource 独立；key 存在即标记）
+        # CPA 元数据：号级风控已由 Build 对话探测判定；此处不再用 JWT bfs 门禁。
         bfs_check = config.get("bfs_check", True)
         if isinstance(bfs_check, str):
             bfs_check = bfs_check.strip().lower() not in ("0", "false", "no", "off")
-        bfs_info = {"ok": False, "has_bfs": False, "bfs": None, "source": ""}
+        bfs_info = {"ok": True, "has_bfs": False, "bfs": None, "source": "thinking_probe"}
         if bfs_check:
-            bfs_info = _s2cpa.inspect_token_bundle_bfs(
-                access_token=str(token.get("access_token") or ""),
-                sso=sso,
-                id_token=str(token.get("id_token") or ""),
-                refresh_token=str(token.get("refresh_token") or ""),
-            )
-            skip_cpa = config.get("bfs_skip_cpa", False)
-            if isinstance(skip_cpa, str):
-                skip_cpa = skip_cpa.strip().lower() in ("1", "true", "yes", "on")
-            if not bfs_info.get("ok"):
-                _cpa_log("JWT bfs 检测: unknown（无法解码 token）")
-                if skip_cpa:
-                    _append_sso_pending(email, sso, log_callback=log_callback)
-                    _cpa_log("bfs_skip_cpa=true，未知状态不写入 CPA/Grok2API，已进入待重转队列")
-                    return False
-            elif bfs_info.get("has_bfs"):
-                detail = (
-                    f"bfs={bfs_info.get('bfs')!r} source={bfs_info.get('source') or '-'}"
-                )
-                _cpa_log(f"JWT bfs 标记: {detail}")
-                _append_sso_bfs_flagged(email, sso, detail, log_callback=log_callback)
-                if skip_cpa:
-                    _cpa_log("bfs_skip_cpa=true，跳过 CPA/Grok2API 写入")
-                    try:
-                        record_register_result(
-                            "ok",
-                            email or "",
-                            kind="bfs_flagged",
-                            detail=detail,
-                            bfs=True,
-                            bfs_value=bfs_info.get("bfs"),
-                            log_callback=log_callback,
-                        )
-                    except Exception:
-                        pass
-                    return False
-            else:
-                _cpa_log("JWT bfs 检测: clean")
+            _cpa_log("Build 对话风控: clean")
 
         record = _s2cpa.token_to_cpa_record(
             token,
@@ -1574,6 +1714,8 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None) -> bool:
             except Exception:
                 pass
         return True
+    except RegistrationRiskDenied:
+        raise
     except Exception as exc:
         _cpa_log(f"直出失败: {redact_sensitive_log_line(str(exc))}")
         _append_sso_pending(email, sso, log_callback=log_callback)
@@ -2214,12 +2356,13 @@ def icloud_take_mailbox():
     cookies = str(config.get("icloud_cookies") or "").strip()
     if not cookies:
         raise Exception("iCloud 需配置 icloud_cookies（Apple 网页会话 Cookie）")
-    if not str(config.get("icloud_temp_mail_base") or "").strip():
-        raise Exception("iCloud 需配置 icloud_temp_mail_base（CF Temp-Mail API Base）")
-    if not str(config.get("icloud_temp_mail_password") or "").strip():
-        raise Exception("iCloud 需配置 icloud_temp_mail_password（Admin 密码）")
     if not str(config.get("icloud_temp_mail_target") or "").strip():
         raise Exception("iCloud 需配置 icloud_temp_mail_target（HME 转发目标邮箱）")
+    if not get_inbucket_api_base():
+        if not str(config.get("icloud_temp_mail_base") or "").strip():
+            raise Exception("iCloud 需配置 icloud_temp_mail_base（CF Temp-Mail API Base）")
+        if not str(config.get("icloud_temp_mail_password") or "").strip():
+            raise Exception("iCloud 需配置 icloud_temp_mail_password（Admin 密码）")
 
     def _log(msg: str) -> None:
         _icloud_log(None, msg)
@@ -2270,6 +2413,7 @@ def icloud_get_oai_code(
         temp_mail_password=str(config.get("icloud_temp_mail_password") or "").strip(),
         temp_mail_target=str(config.get("icloud_temp_mail_target") or "").strip(),
         temp_mail_custom_auth=str(config.get("icloud_temp_mail_custom_auth") or "").strip(),
+        inbucket_api_base=get_inbucket_api_base(),
         http_get=http_get,
         timeout=timeout,
         poll_interval=poll_interval,
@@ -3655,7 +3799,7 @@ class GrokRegisterGUI:
 
         add_label(3, 2, "账号间隔（秒）:")
         self.account_interval_var = tk.StringVar(
-            value=str(config.get("account_interval", "60-120") or "60-120")
+            value=str(config.get("account_interval", "0") or "0")
         )
         add_field(
             tk_entry(config_frame, textvariable=self.account_interval_var, width=20),
@@ -4063,12 +4207,13 @@ class GrokRegisterGUI:
         self.status_label.config(foreground="blue" if running else "green")
 
     def should_stop(self):
-        return self.stop_requested or not self.is_running
+        return self.stop_requested or not self.is_running or risk_breaker_should_stop()
 
     def start_registration(self):
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
             return
+        reset_risk_breaker()
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
@@ -4148,12 +4293,13 @@ class GrokRegisterGUI:
             missing = []
             if not config.get("icloud_cookies"):
                 missing.append("iCloud Cookies")
-            if not config.get("icloud_temp_mail_base"):
-                missing.append("Temp-Mail Base")
-            if not config.get("icloud_temp_mail_password"):
-                missing.append("Temp-Mail Admin 密码")
             if not config.get("icloud_temp_mail_target"):
                 missing.append("HME 转发目标邮箱")
+            if not get_inbucket_api_base():
+                if not config.get("icloud_temp_mail_base"):
+                    missing.append("Temp-Mail Base")
+                if not config.get("icloud_temp_mail_password"):
+                    missing.append("Temp-Mail Admin 密码")
             if missing:
                 self.log(f"[!] iCloud 模式缺少配置: {', '.join(missing)}")
                 return
@@ -4343,6 +4489,8 @@ class GrokRegisterGUI:
             retry_count_for_slot = 0
             max_slot_retry = slot_retries()
             while i < count:
+                if apply_risk_breaker_wait(wlog, self.should_stop, sleep_with_cancel):
+                    break
                 if self.should_stop():
                     break
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
@@ -4438,7 +4586,12 @@ class GrokRegisterGUI:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
-                    cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=wlog)
+                    cpa_ok = finish_account_delivery(
+                        email,
+                        password=str(profile.get("password") or ""),
+                        sso=sso,
+                        log_callback=wlog,
+                    )
                     self._record_success()
                     commit_active_icloud_as_registered(email=email, log_callback=wlog)
                     retry_count_for_slot = 0
@@ -4542,7 +4695,7 @@ class CliStopController:
         self.stop_requested = False
 
     def should_stop(self):
-        return self.stop_requested
+        return self.stop_requested or risk_breaker_should_stop()
 
     def stop(self):
         self.stop_requested = True
@@ -4561,6 +4714,7 @@ def cli_log(message):
 
 def run_registration_cli(count):
     controller = CliStopController()
+    reset_risk_breaker()
 
     # 一次 Ctrl+C 可靠置停：SIGINT 处理器直接设停止标志，不依赖异常在
     # curl_cffi C 回调里向上传播（那里 KeyboardInterrupt 会被吞掉，导致
@@ -4742,6 +4896,13 @@ def run_registration_cli(count):
                 retry = 0
                 worker_stop = False
                 while i < n and not controller.should_stop() and not worker_stop:
+                    if apply_risk_breaker_wait(
+                        lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        controller.should_stop,
+                        sleep_with_cancel,
+                    ):
+                        worker_stop = True
+                        break
                     email = ""
                     try:
                         delay = reserve_signup_submit_slot()
@@ -4800,8 +4961,11 @@ def run_registration_cli(count):
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                        cpa_ok = add_sso_to_cpa(
-                            sso, email=email, log_callback=lambda m: cli_log(f"[W{wid+1}] {m}")
+                        cpa_ok = finish_account_delivery(
+                            email,
+                            password=str(profile.get("password") or ""),
+                            sso=sso,
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                         )
                         local_success += 1
                         mark_successful_account()
@@ -5133,6 +5297,8 @@ def run_registration_cli(count):
         cli_log("[*] 浏览器已启动")
         i = 0
         while i < count:
+            if apply_risk_breaker_wait(cli_log, controller.should_stop, sleep_with_cancel):
+                break
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
@@ -5213,7 +5379,12 @@ def run_registration_cli(count):
                     cli_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
-                cpa_ok = add_sso_to_cpa(sso, email=email, log_callback=cli_log)
+                cpa_ok = finish_account_delivery(
+                    email,
+                    password=str(profile.get("password") or ""),
+                    sso=sso,
+                    log_callback=cli_log,
+                )
                 success_count += 1
                 mark_successful_account()
                 commit_active_icloud_as_registered(email=email, log_callback=cli_log)

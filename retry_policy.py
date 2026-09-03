@@ -12,6 +12,10 @@ SLOT_RETRIES_DEFAULT = 1
 BATCH_MAX_RESTARTS_DEFAULT = 2
 ORCH_MAX_CONSECUTIVE_FAILURES_DEFAULT = 2
 PRECHECK_EXIT_CODE = 78
+RISK_STREAK_WAIT_START_DEFAULT = 2
+RISK_STREAK_STOP_DEFAULT = 5
+RISK_STREAK_WAIT_BASE_DEFAULT = 30
+RISK_STREAK_WAIT_MAX_DEFAULT = 300
 
 
 def bounded_env_int(
@@ -67,4 +71,52 @@ def orchestrator_failure_limit(environ: Mapping[str, str] | None = None) -> int:
         minimum=1,
         maximum=10,
         environ=environ,
+    )
+
+
+def risk_streak_wait_start(environ: Mapping[str, str] | None = None) -> int:
+    return bounded_env_int(
+        "GROK_RISK_STREAK_WAIT",
+        RISK_STREAK_WAIT_START_DEFAULT,
+        minimum=1,
+        maximum=20,
+        environ=environ,
+    )
+
+
+def risk_streak_stop(environ: Mapping[str, str] | None = None) -> int:
+    start = risk_streak_wait_start(environ)
+    return max(
+        start + 1,
+        bounded_env_int(
+            "GROK_RISK_STREAK_STOP",
+            RISK_STREAK_STOP_DEFAULT,
+            minimum=2,
+            maximum=30,
+            environ=environ,
+        ),
+    )
+
+
+def risk_streak_wait_base(environ: Mapping[str, str] | None = None) -> int:
+    return bounded_env_int(
+        "GROK_RISK_WAIT_BASE",
+        RISK_STREAK_WAIT_BASE_DEFAULT,
+        minimum=5,
+        maximum=600,
+        environ=environ,
+    )
+
+
+def risk_streak_wait_max(environ: Mapping[str, str] | None = None) -> int:
+    base = risk_streak_wait_base(environ)
+    return max(
+        base,
+        bounded_env_int(
+            "GROK_RISK_WAIT_MAX",
+            RISK_STREAK_WAIT_MAX_DEFAULT,
+            minimum=10,
+            maximum=3600,
+            environ=environ,
+        ),
     )

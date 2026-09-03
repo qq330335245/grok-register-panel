@@ -27,6 +27,7 @@ BOOL_FIELDS = (
     "grok2api_auto_upload",
     "grok2api_upload_web",
     "grok2api_upload_console",
+    "upload_when_risk_unknown",
 )
 SECRET_FIELDS = ("cpa_management_key", "grok2api_admin_password")
 INT_FIELDS = ("grok2api_upload_retries",)
@@ -52,6 +53,7 @@ DEFAULTS = {
     "grok2api_auto_upload": False,
     "grok2api_upload_web": False,
     "grok2api_upload_console": False,
+    "upload_when_risk_unknown": True,
     "grok2api_base_url": "",
     "grok2api_admin_user": "admin",
     "grok2api_admin_password": "",
@@ -121,6 +123,9 @@ def _merged(raw: dict) -> dict:
     values["grok2api_auto_upload"] = _bool(values.get("grok2api_auto_upload"), False)
     values["grok2api_upload_web"] = _bool(values.get("grok2api_upload_web"), False)
     values["grok2api_upload_console"] = _bool(values.get("grok2api_upload_console"), False)
+    values["upload_when_risk_unknown"] = _bool(
+        values.get("upload_when_risk_unknown"), True
+    )
     mode = str(values.get("cpa_token_mode") or "device_protocol").strip().lower()
     values["cpa_token_mode"] = mode if mode in TOKEN_MODES else "device_protocol"
     values["cpa_auth_dir"] = str(values.get("cpa_auth_dir") or "cpa_auth").strip() or "cpa_auth"

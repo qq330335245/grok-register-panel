@@ -394,6 +394,39 @@ def test_probe_proxy_falls_back_to_ipv6_after_v4_socks_failure():
             sys.modules["curl_cffi.requests"] = previous_cffi_req
 
 
+def test_sticky_template_risk_does_not_cooldown():
+    with IsolatedStore():
+        imported = proxy_store.import_proxies(
+            "socks5h://g2a.{account}:token@resin.example:2260"
+        )
+        proxy_id = imported["imported_ids"][0]
+        proxy_store._apply_probe_result(
+            proxy_id,
+            {
+                "ok": True,
+                "exit_ip": "2001:db8::10",
+                "asn": 64500,
+                "asn_org": "Sticky",
+                "latency_ms": 80,
+                "checked_at": "2026-09-03T00:00:00Z",
+            },
+        )
+        template = proxy_store.list_worker_proxies()[0]
+        expanded = proxy_store.expand_proxy_url(template, email="a@b.com", account="a@b.com")
+        assert proxy_store.record_proxy_result(expanded, "risk", "no thinking on 2 sticky exits")
+        public = proxy_store.read_proxy_pool()["items"][0]
+        assert public["stored_status"] != "cooldown"
+        assert public["cooldown_reason"] == ""
+        assert public["risk_count"] == 1
+        assert template in proxy_store.list_worker_proxies()
+        assert proxy_store.record_proxy_result(
+            expanded, "network", "No such file or directory: '/tmp/grok-register-camoufox'"
+        )
+        public = proxy_store.read_proxy_pool()["items"][0]
+        assert public["stored_status"] != "cooldown"
+        assert template in proxy_store.list_worker_proxies()
+
+
 if __name__ == "__main__":
     test_sticky_template_normalize_expand_and_probe_identity()
     test_normalize_proxy_formats_and_rejects_paths()
@@ -406,4 +439,5 @@ if __name__ == "__main__":
     test_1024_ports_never_enter_worker_pool()
     test_parse_probe_payload_accepts_ipv6_json_and_plain_ip()
     test_probe_proxy_falls_back_to_ipv6_after_v4_socks_failure()
+    test_sticky_template_risk_does_not_cooldown()
     print("OK proxy store")

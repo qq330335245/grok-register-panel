@@ -257,6 +257,115 @@ def inspect_jwt_bfs(token: str) -> dict:
     }
 
 
+def _numeric_bot_flag(value: object) -> int:
+    """grok2api: only JSON numbers 1 and 2 count (bool/string/other ignored)."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value in (1, 2):
+        return value
+    if isinstance(value, float) and value in (1.0, 2.0):
+        return int(value)
+    return 0
+
+
+def bot_flag_source_from_claims(claims: dict | None) -> int:
+    """Prefer bot_flag_source when it is 1/2; otherwise bfs. Else 0."""
+    if not isinstance(claims, dict):
+        return 0
+    source = _numeric_bot_flag(claims.get("bot_flag_source"))
+    if source:
+        return source
+    return _numeric_bot_flag(claims.get("bfs"))
+
+
+def _jwt_claims(token: str) -> tuple[bool, dict]:
+    raw = str(token or "").strip()
+    if raw.startswith("sso="):
+        raw = raw[4:].strip()
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            for key in ("access_token", "token", "sso", "id_token", "key"):
+                nested = str(obj.get(key) or "").strip()
+                if nested.count(".") >= 2:
+                    raw = nested
+                    break
+    if raw.count(".") < 2:
+        return False, {}
+    return _decode_jwt_payload_with_status(raw)
+
+
+def inspect_jwt_build_bot_flag(token: str) -> dict:
+    """Match grok2api Build CredentialMetadata: flagged only when claim is 1 or 2."""
+    ok, claims = _jwt_claims(token)
+    source = bot_flag_source_from_claims(claims) if ok else 0
+    return {
+        "ok": ok,
+        "source": source,
+        "flagged": source in (1, 2),
+        "token_source": "",
+        "bfs": claims.get("bfs") if ok else None,
+        "bot_flag_source": claims.get("bot_flag_source") if ok else None,
+        "sub": str(claims.get("sub") or claims.get("principal_id") or "")[:48] if ok else "",
+        "claim_keys": sorted(str(k) for k in claims.keys()) if claims else [],
+    }
+
+
+def inspect_token_bundle_build_bot_flag(
+    *,
+    access_token: str = "",
+    sso: str = "",
+    id_token: str = "",
+    refresh_token: str = "",
+) -> dict:
+    """Prefer Build access_token like grok2api; fall back to SSO/id/refresh."""
+    empty = {
+        "ok": False,
+        "source": 0,
+        "flagged": False,
+        "token_source": "",
+        "bfs": None,
+        "bot_flag_source": None,
+        "sub": "",
+        "claim_keys": [],
+        "checked": [],
+    }
+    sources: list[tuple[str, str]] = [
+        ("access_token", str(access_token or "").strip()),
+        ("sso", str(sso or "").strip()),
+        ("id_token", str(id_token or "").strip()),
+        ("refresh_token", str(refresh_token or "").strip()),
+    ]
+    first_ok: dict | None = None
+    checked: list[str] = []
+    for name, value in sources:
+        if not value:
+            continue
+        info = inspect_jwt_build_bot_flag(value)
+        if value.count(".") >= 2 or str(value).strip().startswith("{"):
+            checked.append(name)
+        if not info.get("ok"):
+            continue
+        info = dict(info)
+        info["token_source"] = name
+        info["checked"] = checked
+        if info.get("flagged"):
+            return info
+        if first_ok is None:
+            first_ok = info
+        # access_token decoded cleanly: do not keep looking for flags on SSO
+        if name == "access_token":
+            return info
+    if first_ok is not None:
+        first_ok["checked"] = checked
+        return first_ok
+    empty["checked"] = checked
+    return empty
+
+
 def inspect_token_bundle_bfs(
     *,
     access_token: str = "",

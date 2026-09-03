@@ -12,17 +12,18 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from secure_files import atomic_write_json, best_effort_fchmod, ensure_private_dir
+from secure_files import atomic_write_json, best_effort_fchmod, ensure_private_dir, exclusive_file_lock
 from batch_traffic import read_metrics as read_batch_traffic
 from batch_traffic import read_summary as read_batch_traffic_summary
 from runtime_platform import (
     apply_playwright_node_env,
+    apply_runtime_tmpdir,
     batch_launch_command,
     batch_runtime_error,
     beijing_strftime,
@@ -30,6 +31,8 @@ from runtime_platform import (
     popen_group_kwargs,
     runtime_python,
 )
+
+apply_runtime_tmpdir()
 
 try:
     from webui.blacklist_store import read_blacklist as read_blacklist_state
@@ -59,6 +62,8 @@ try:
         save_delivery_config,
         test_delivery_config,
     )
+    from webui.account_store import get_account, list_accounts, import_files as import_account_files, delete_accounts
+    from webui.account_ops import job_status as accounts_job_status, start_batch as start_accounts_batch
     from webui.icloud_ops import (
         add_account as add_icloud_account,
         delete_account as delete_icloud_account,
@@ -120,6 +125,8 @@ except ImportError:  # running as script from webui/
         save_delivery_config,
         test_delivery_config,
     )
+    from account_store import get_account, list_accounts, import_files as import_account_files, delete_accounts  # type: ignore
+    from account_ops import job_status as accounts_job_status, start_batch as start_accounts_batch  # type: ignore
     from icloud_ops import (  # type: ignore
         add_account as add_icloud_account,
         delete_account as delete_icloud_account,
@@ -252,6 +259,46 @@ def _write_json(path: Path, data: dict):
     atomic_write_json(path, data)
 
 
+def _normalize_account_interval(raw: object) -> str:
+    text = str(raw or "0").strip()
+    if not text:
+        return "0"
+    if text == "0":
+        return "0"
+    try:
+        if "-" in text:
+            left, right = text.split("-", 1)
+            lo = max(0, int(left.strip()))
+            hi = max(lo, int(right.strip()))
+            return f"{lo}-{hi}"
+        return str(max(0, int(float(text))))
+    except (TypeError, ValueError):
+        return "0"
+
+
+def _read_config_account_interval() -> str:
+    path = ROOT / "config.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return _normalize_account_interval(data.get("account_interval", "0"))
+    except Exception:
+        return "0"
+
+
+def _write_config_account_interval(value: str) -> None:
+    path = ROOT / "config.json"
+    lock = path.with_suffix(path.suffix + ".lock")
+    with exclusive_file_lock(lock):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data["account_interval"] = value
+        atomic_write_json(path, data)
+
+
 def load_control() -> dict:
     with CONTROL_LOCK:
         c = _read_json(CONTROL_FILE, {})
@@ -259,6 +306,7 @@ def load_control() -> dict:
         c.setdefault("risk_pause", 10)
         c.setdefault("batch_count", 40)
         c.setdefault("add_count", 40)  # 再跑 N 个
+        c.setdefault("account_interval", _read_config_account_interval())
         c.setdefault("mode", "orch")  # orch | batch
         return c
 
@@ -269,6 +317,7 @@ def save_control(updates: dict) -> dict:
         "risk_pause",
         "batch_count",
         "add_count",
+        "account_interval",
         "mode",
         "base_cpa",
         "target_cpa",
@@ -293,6 +342,11 @@ def save_control(updates: dict) -> dict:
         except Exception:
             c["add_count"] = 40
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
+        c["account_interval"] = _normalize_account_interval(c.get("account_interval"))
+        try:
+            _write_config_account_interval(c["account_interval"])
+        except Exception:
+            pass
         for key in ("base_cpa", "target_cpa"):
             if c.get(key) is None or str(c.get(key)).strip() == "":
                 c.pop(key, None)
@@ -732,6 +786,7 @@ def _registration_env() -> dict[str, str]:
     if os.name == "nt":
         env.setdefault("GROK_HEADLESS", "1")
         env.setdefault("PYTHONUTF8", "1")
+    apply_runtime_tmpdir(env)
     apply_playwright_node_env(env)
     return env
 
@@ -1559,6 +1614,68 @@ HTML = r"""<!DOCTYPE html>
   body.domain-view-open #dashboard-view > :not(#domain-view) { display: none; }
   body.delivery-view-open { overflow: hidden; }
   body.delivery-view-open #dashboard-view > :not(#delivery-view) { display: none; }
+  body.accounts-view-open { overflow: hidden; }
+  body.accounts-view-open #dashboard-view > :not(#accounts-view) { display: none; }
+  .accounts-view {
+    position: fixed; inset: 68px 0 0; z-index: 8; overflow-y: auto;
+    overscroll-behavior: contain; background-color: var(--bg);
+    background-image: linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .accounts-view[hidden] { display: none; }
+  .accounts-view-inner { width: min(calc(100% - 64px), 1280px); margin: 0 auto; padding: 28px 0 48px; }
+  .accounts-toolbar { display: flex; flex-wrap: wrap; gap: 10px 12px; align-items: end; margin-bottom: 14px; }
+  .accounts-toolbar .field { min-width: 140px; }
+  .accounts-table-wrap {
+    max-height: calc(100vh - 340px);
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--card);
+  }
+  .accounts-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .accounts-table th, .accounts-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; }
+  .accounts-table th {
+    color: var(--muted); font-weight: 600; position: sticky; top: 0; z-index: 1;
+    background: var(--card); box-shadow: 0 1px 0 var(--border);
+  }
+  .accounts-table input[type="checkbox"] {
+    width: 14px; height: 14px; min-height: 0; min-width: 0; margin: 0;
+    padding: 0; accent-color: var(--accent); vertical-align: middle;
+    box-shadow: none; border-radius: 3px;
+  }
+  .acct-check-col { width: 28px; }
+  .acct-badge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); }
+  .acct-badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+  .acct-badge.warn { color: var(--warn); }
+  .acct-badge.fail { color: var(--danger); }
+  .acct-risk { display: flex; flex-direction: column; gap: 2px; }
+  .acct-risk-detail {
+    color: var(--muted); font-size: 11px; max-width: 320px; white-space: normal;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .acct-result-detail { white-space: pre-wrap; word-break: break-word; }
+  .accounts-pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+  .acct-modal {
+    position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, #000 45%, transparent); padding: 24px;
+  }
+  .acct-modal[hidden] { display: none; }
+  .acct-modal-card {
+    width: min(720px, 100%); max-height: min(80vh, 720px); overflow: auto;
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px 20px 20px;
+    box-shadow: 0 18px 50px color-mix(in srgb, #000 28%, transparent);
+  }
+  .acct-modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .acct-modal-head h3 { margin: 0; font-size: 16px; }
+  .acct-modal-dl { display: grid; grid-template-columns: 88px 1fr; gap: 8px 12px; font-size: 13px; }
+  .acct-modal-dl dt { color: var(--muted); }
+  .acct-modal-dl dd { margin: 0; word-break: break-all; }
+  .acct-result-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .acct-result-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: start; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; }
+  .acct-result-email { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .acct-result-detail { color: var(--muted); font-size: 12px; margin-top: 3px; }
   .delivery-view {
     position: fixed;
     inset: 68px 0 0;
@@ -2002,16 +2119,18 @@ HTML = r"""<!DOCTYPE html>
     .button-group { justify-content: flex-start; }
     #run-status { display: none; }
     button.view-switch { min-width: 0; padding-inline: 6px; }
-    #domain-view-label, #proxy-view-label, #sso-view-label, #help-view-label, #delivery-view-label { font-size: 0; }
+    #domain-view-label, #proxy-view-label, #sso-view-label, #help-view-label, #delivery-view-label, #accounts-view-label { font-size: 0; }
     #domain-view-label::after { content: "邮箱"; font-size: 11px; }
     #proxy-view-label::after { content: "代理"; font-size: 11px; }
     #sso-view-label::after { content: "风控"; font-size: 11px; }
     #delivery-view-label::after { content: "入库"; font-size: 11px; }
+    #accounts-view-label::after { content: "账号"; font-size: 11px; }
     #help-view-label::after { content: "问题"; font-size: 11px; }
     #domain-view-toggle[data-active="true"] #domain-view-label::after,
     #proxy-view-toggle[data-active="true"] #proxy-view-label::after,
     #sso-view-toggle[data-active="true"] #sso-view-label::after,
     #delivery-view-toggle[data-active="true"] #delivery-view-label::after,
+    #accounts-view-toggle[data-active="true"] #accounts-view-label::after,
     #help-view-toggle[data-active="true"] #help-view-label::after { content: "返回"; }
     button.theme-option { padding-inline: 6px; }
     .domain-settings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2087,6 +2206,9 @@ HTML = r"""<!DOCTYPE html>
       <button type="button" class="view-switch" id="delivery-view-toggle" aria-label="打开入库配置" title="入库配置" aria-controls="delivery-view" aria-expanded="false" data-active="false" onclick="toggleDeliveryView()">
         <span id="delivery-view-label" aria-hidden="true">入库配置</span>
       </button>
+      <button type="button" class="view-switch" id="accounts-view-toggle" aria-label="打开账号管理" title="账号管理" aria-controls="accounts-view" aria-expanded="false" data-active="false" onclick="toggleAccountsView()">
+        <span id="accounts-view-label" aria-hidden="true">账号管理</span>
+      </button>
       <button type="button" class="view-switch" id="help-view-toggle" aria-label="打开问题和使用" title="问题和使用" aria-controls="help-view" aria-expanded="false" data-active="false" onclick="toggleAppView()">
         <span id="help-view-label" aria-hidden="true">问题和使用</span>
       </button>
@@ -2135,6 +2257,9 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div class="field"><label for="risk_pause">风控阈值</label>
         <input type="number" id="risk_pause" min="1" max="50" value="10"/>
+      </div>
+      <div class="field"><label for="account_interval">号间隔（秒）</label>
+        <input id="account_interval" type="text" value="0" placeholder="0 或 60-120" title="号与号之间等待：0=不等，30=固定30秒，60-120=随机"/>
       </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()">启动任务</button>
@@ -2198,7 +2323,7 @@ HTML = r"""<!DOCTYPE html>
           </details>
           <details class="faq-item" data-faq-item data-search="风控 policy deny registration risk botFlagSource ip 邮箱 域名">
             <summary>出现 policy=deny 或注册风控</summary>
-            <div class="faq-answer">该账号已被注册风控拒绝，不要反复重转同一 SSO。先更换质量更好的出口并给 IP 冷却时间，邮箱优先使用稳定的子域名，并发先保持 2-3。</div>
+            <div class="faq-answer">注册门禁已改为 grok2api 同款 Build 对话探测：换出 Build token 后打 grok-4.5 思考流，两个粘性出口都无 reasoning 则记为号级风控。动态粘性节点不因风控冷却。连续少量风控会暂停再试，连续加重则整批停止。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="bfs jwt claim access_token 标记 flagged 风控 检测 scan">
             <summary>什么是 bfs，和 botFlagSource 有何不同</summary>
@@ -2469,6 +2594,7 @@ HTML = r"""<!DOCTYPE html>
           <label><input type="checkbox" id="delivery-g2a-build"/> 远程上传 Build</label>
           <label><input type="checkbox" id="delivery-g2a-web"/> 远程上传 Web</label>
           <label><input type="checkbox" id="delivery-g2a-console"/> 远程上传 Console</label>
+          <label><input type="checkbox" id="delivery-upload-unknown"/> 风控未确认也上传</label>
         </div>
         <div class="mail-provider-fields">
           <div class="field"><label for="delivery-token-mode">Token 换取</label>
@@ -2508,6 +2634,94 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div class="msg mail-provider-result" id="delivery-msg" role="status" aria-live="polite"></div>
       </section>
+    </div>
+  </section>
+
+  <section class="accounts-view" id="accounts-view" aria-labelledby="accounts-view-title" hidden>
+    <div class="accounts-view-inner">
+      <div class="delivery-view-heading">
+        <div>
+          <div class="mail-source-kicker">Registered accounts</div>
+          <div class="page-title" id="accounts-view-title">账号管理</div>
+          <p class="delivery-view-subtitle" id="accounts-subtitle">已注册账号的风控状态与上传记录</p>
+        </div>
+        <span class="sso-job mono" id="accounts-job">尚未加载</span>
+      </div>
+      <div class="sso-summary" id="accounts-summary">
+        <div class="sso-summary-item"><div class="sso-summary-label">总数</div><div class="sso-summary-value" id="acct-kpi-total">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">干净</div><div class="sso-summary-value ok" id="acct-kpi-clean">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">未确认</div><div class="sso-summary-value warn" id="acct-kpi-unknown">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">降智</div><div class="sso-summary-value fail" id="acct-kpi-flagged">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">已上传</div><div class="sso-summary-value" id="acct-kpi-uploaded">--</div></div>
+        <div class="sso-summary-item"><div class="sso-summary-label">未上传</div><div class="sso-summary-value" id="acct-kpi-pending">--</div></div>
+      </div>
+      <div class="accounts-toolbar">
+        <div class="field"><label for="acct-q">搜索邮箱</label><input id="acct-q" type="search" onkeydown="if(event.key==='Enter')loadAccounts(1)"/></div>
+        <div class="field"><label for="acct-risk">风控</label>
+          <select id="acct-risk" onchange="loadAccounts(1)">
+            <option value="">全部</option>
+            <option value="clean">干净</option>
+            <option value="unknown">未确认</option>
+            <option value="flagged">降智</option>
+          </select>
+        </div>
+        <div class="field"><label for="acct-uploaded">上传</label>
+          <select id="acct-uploaded" onchange="loadAccounts(1)">
+            <option value="">全部</option>
+            <option value="1">已上传</option>
+            <option value="0">未上传</option>
+          </select>
+        </div>
+        <div class="field"><label for="acct-sort">排序</label>
+          <select id="acct-sort" onchange="loadAccounts(1)">
+            <option value="created_at">注册时间</option>
+            <option value="updated_at">最近更新</option>
+            <option value="email">邮箱</option>
+            <option value="risk_status">风控</option>
+            <option value="uploaded">上传</option>
+          </select>
+        </div>
+        <div class="field"><label for="acct-page-size">每页</label>
+          <select id="acct-page-size" onchange="loadAccounts(1)">
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+          </select>
+        </div>
+        <div class="button-group">
+          <button class="primary" onclick="loadAccounts(1)">查询</button>
+          <button onclick="importAccountFiles()">扫描目录</button>
+          <button onclick="accountsBatch('detect')">检测风控</button>
+          <button onclick="accountsBatch('upload')">补上传</button>
+          <button class="danger" onclick="deleteSelectedAccounts()">删除</button>
+        </div>
+      </div>
+      <div class="accounts-table-wrap">
+        <table class="accounts-table">
+          <thead><tr>
+            <th class="acct-check-col"><input type="checkbox" id="acct-all" onchange="toggleAccountAll(this.checked)"/></th>
+            <th>邮箱</th><th>风控</th><th>已上传</th><th>Web</th><th>Build</th><th>创建时间</th><th>操作</th>
+          </tr></thead>
+          <tbody id="acct-body"><tr><td colspan="8" class="domain-empty">尚未加载</td></tr></tbody>
+        </table>
+      </div>
+      <div class="accounts-pager">
+        <button onclick="loadAccounts((acctPage||1)-1)">上一页</button>
+        <span class="mono" id="acct-page-label">-</span>
+        <button onclick="loadAccounts((acctPage||1)+1)">下一页</button>
+      </div>
+      <div class="msg" id="acct-msg" role="status"></div>
+      <div class="acct-modal" id="acct-modal" hidden onclick="if(event.target===this)closeAcctModal()">
+        <div class="acct-modal-card" role="dialog" aria-modal="true" aria-labelledby="acct-modal-title">
+          <div class="acct-modal-head">
+            <h3 id="acct-modal-title">账号信息</h3>
+            <button type="button" onclick="closeAcctModal()">关闭</button>
+          </div>
+          <div id="acct-modal-body">读取中…</div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -2777,13 +2991,14 @@ function setTheme(theme) {
   syncThemeButtons();
 }
 function setAppView(view, options = {}) {
-  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "sso" && view !== "delivery") return;
+  if (view !== "dashboard" && view !== "help" && view !== "proxies" && view !== "domains" && view !== "sso" && view !== "delivery" && view !== "accounts") return;
   const dashboard = document.getElementById("dashboard-view");
   const help = document.getElementById("help-view");
   const proxies = document.getElementById("proxy-view");
   const domains = document.getElementById("domain-view");
   const sso = document.getElementById("sso-view");
   const delivery = document.getElementById("delivery-view");
+  const accounts = document.getElementById("accounts-view");
   const domainToggle = document.getElementById("domain-view-toggle");
   const domainLabel = document.getElementById("domain-view-label");
   const toggle = document.getElementById("help-view-toggle");
@@ -2794,14 +3009,17 @@ function setAppView(view, options = {}) {
   const ssoLabel = document.getElementById("sso-view-label");
   const deliveryToggle = document.getElementById("delivery-view-toggle");
   const deliveryLabel = document.getElementById("delivery-view-label");
-  if (!dashboard || !help || !proxies || !domains || !sso || !delivery || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ssoToggle || !ssoLabel || !deliveryToggle || !deliveryLabel) return;
+  const accountsToggle = document.getElementById("accounts-view-toggle");
+  const accountsLabel = document.getElementById("accounts-view-label");
+  if (!dashboard || !help || !proxies || !domains || !sso || !delivery || !accounts || !domainToggle || !domainLabel || !toggle || !label || !proxyToggle || !proxyLabel || !ssoToggle || !ssoLabel || !deliveryToggle || !deliveryLabel || !accountsToggle || !accountsLabel) return;
   const isHelp = view === "help";
   const isProxies = view === "proxies";
   const isDomains = view === "domains";
   const isSso = view === "sso";
   const isDelivery = view === "delivery";
-  const isOverlay = isHelp || isProxies || isDomains || isSso || isDelivery;
-  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== sso && element !== delivery);
+  const isAccounts = view === "accounts";
+  const isOverlay = isHelp || isProxies || isDomains || isSso || isDelivery || isAccounts;
+  const dashboardChildren = Array.from(dashboard.children).filter(element => element !== help && element !== proxies && element !== domains && element !== sso && element !== delivery && element !== accounts);
   dashboardChildren.forEach(element => {
     element.inert = isOverlay;
     if (isOverlay) element.setAttribute("aria-hidden", "true");
@@ -2817,11 +3035,14 @@ function setAppView(view, options = {}) {
   sso.inert = !isSso;
   delivery.hidden = !isDelivery;
   delivery.inert = !isDelivery;
+  accounts.hidden = !isAccounts;
+  accounts.inert = !isAccounts;
   document.body.classList.toggle("help-view-open", isHelp);
   document.body.classList.toggle("proxy-view-open", isProxies);
   document.body.classList.toggle("domain-view-open", isDomains);
   document.body.classList.toggle("sso-view-open", isSso);
   document.body.classList.toggle("delivery-view-open", isDelivery);
+  document.body.classList.toggle("accounts-view-open", isAccounts);
   toggle.dataset.active = String(isHelp);
   toggle.setAttribute("aria-expanded", String(isHelp));
   toggle.setAttribute("aria-label", isHelp ? "返回控制台" : "打开问题和使用");
@@ -2847,6 +3068,11 @@ function setAppView(view, options = {}) {
   deliveryToggle.setAttribute("aria-label", isDelivery ? "返回控制台" : "打开入库配置");
   deliveryToggle.title = isDelivery ? "返回控制台" : "入库配置";
   deliveryLabel.textContent = isDelivery ? "返回控制台" : "入库配置";
+  accountsToggle.dataset.active = String(isAccounts);
+  accountsToggle.setAttribute("aria-expanded", String(isAccounts));
+  accountsToggle.setAttribute("aria-label", isAccounts ? "返回控制台" : "打开账号管理");
+  accountsToggle.title = isAccounts ? "返回控制台" : "账号管理";
+  accountsLabel.textContent = isAccounts ? "返回控制台" : "账号管理";
   if (options.persist !== false) {
     try { localStorage.setItem(APP_VIEW_KEY, view); } catch (e) {}
   }
@@ -2857,6 +3083,7 @@ function setAppView(view, options = {}) {
   }
   if (isSso) refreshSsoState();
   if (isDelivery) refreshDeliveryConfig();
+  if (isAccounts) loadAccounts(acctPage || 1);
   if (options.focus) {
     requestAnimationFrame(() => {
       const target = isHelp
@@ -2885,6 +3112,10 @@ function toggleSsoView() {
 function toggleDeliveryView() {
   const isDelivery = document.body.classList.contains("delivery-view-open");
   setAppView(isDelivery ? "dashboard" : "delivery", { focus: true });
+}
+function toggleAccountsView() {
+  const isAccounts = document.body.classList.contains("accounts-view-open");
+  setAppView(isAccounts ? "dashboard" : "accounts", { focus: true });
 }
 function setHelpTab(name) {
   if (name !== "guide" && name !== "faq") return;
@@ -2940,14 +3171,18 @@ function initHelp() {
     view = localStorage.getItem(APP_VIEW_KEY) || "dashboard";
     tab = localStorage.getItem(HELP_TAB_KEY) || "guide";
   } catch (e) {}
-  if (!["dashboard", "help", "proxies", "domains", "sso"].includes(view)) view = "dashboard";
+  if (!["dashboard", "help", "proxies", "domains", "sso", "delivery", "accounts"].includes(view)) view = "dashboard";
   setHelpTab(tab);
   filterFaq("");
   setAppView(view, { persist: false, focus: false });
 }
 document.addEventListener("keydown", event => {
-  if (event.key === "Escape" && (document.body.classList.contains("help-view-open") || document.body.classList.contains("proxy-view-open") || document.body.classList.contains("domain-view-open") || document.body.classList.contains("sso-view-open"))) {
-    setAppView("dashboard", { focus: true });
+  if (event.key === "Escape") {
+    const modal = document.getElementById("acct-modal");
+    if (modal && !modal.hidden) { closeAcctModal(); return; }
+    if (document.body.classList.contains("help-view-open") || document.body.classList.contains("proxy-view-open") || document.body.classList.contains("domain-view-open") || document.body.classList.contains("sso-view-open") || document.body.classList.contains("delivery-view-open") || document.body.classList.contains("accounts-view-open")) {
+      setAppView("dashboard", { focus: true });
+    }
   }
 });
 function esc(s) {
@@ -3024,11 +3259,27 @@ async function api(path, opts) {
 function proxyStatusLabel(status) {
   return ({ healthy: "健康", unhealthy: "异常", cooldown: "冷却", testing: "检测中", unknown: "未检测" })[status] || "未检测";
 }
+function formatBeijing(value) {
+  if (value == null || value === "" || value === 0) return "--";
+  const date = typeof value === "number"
+    ? new Date(value < 1e12 ? value * 1000 : value)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
 function proxyTime(value) {
   if (!value) return "--";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value);
-  // 统一北京时间展示（服务器可能是 UTC）
   return date.toLocaleString("zh-CN", {
     timeZone: "Asia/Shanghai",
     month: "2-digit",
@@ -3380,6 +3631,8 @@ function renderDeliveryConfig(data) {
   document.getElementById("delivery-g2a-build").checked = !!values.grok2api_auto_upload;
   document.getElementById("delivery-g2a-web").checked = !!values.grok2api_upload_web;
   document.getElementById("delivery-g2a-console").checked = !!values.grok2api_upload_console;
+  const unk = document.getElementById("delivery-upload-unknown");
+  if (unk) unk.checked = values.upload_when_risk_unknown !== false;
   document.getElementById("delivery-token-mode").value = values.cpa_token_mode || "device_protocol";
   document.getElementById("delivery-cpa-dir").value = values.cpa_auth_dir || "";
   document.getElementById("delivery-g2a-dir").value = values.grok2api_auth_dir || "";
@@ -3410,6 +3663,7 @@ function collectDeliverySettings() {
     grok2api_auto_upload: document.getElementById("delivery-g2a-build").checked,
     grok2api_upload_web: document.getElementById("delivery-g2a-web").checked,
     grok2api_upload_console: document.getElementById("delivery-g2a-console").checked,
+    upload_when_risk_unknown: document.getElementById("delivery-upload-unknown").checked,
     cpa_token_mode: document.getElementById("delivery-token-mode").value,
     cpa_auth_dir: document.getElementById("delivery-cpa-dir").value,
     grok2api_auth_dir: document.getElementById("delivery-g2a-dir").value,
@@ -3458,6 +3712,175 @@ async function testDeliveryConfig() {
     setMsg("delivery-msg", result.detail || "登录成功", "ok");
   } catch (e) { setMsg("delivery-msg", String(e.message || e), "err"); }
   button.disabled = false;
+}
+let acctPage = 1;
+let acctTimer = 0;
+let acctLastJobSig = "";
+function riskLabel(status) {
+  return ({ clean: "干净", flagged: "降智", unknown: "未确认" })[status] || (status || "-");
+}
+function riskBadge(status) {
+  const cls = ({ clean: "ok", flagged: "fail", unknown: "warn" })[status] || "";
+  return `<span class="acct-badge ${cls}">${esc(riskLabel(status))}</span>`;
+}
+function riskDetailLine(it) {
+  const detail = String(it.risk_detail || "").trim();
+  if (it.risk_status === "clean") return detail ? ("有思考 · " + detail.replace(/^thinking\s*/i, "")) : "Build 对话有思考";
+  if (it.risk_status === "flagged") return detail || "无思考，判定号级降智";
+  if (it.risk_status === "unknown") return detail || "探测未完成，未判定";
+  return detail;
+}
+function selectedAccountEmails() {
+  return Array.from(document.querySelectorAll(".acct-row:checked")).map(el => el.value);
+}
+function toggleAccountAll(on) {
+  document.querySelectorAll(".acct-row").forEach(el => { el.checked = !!on; });
+}
+function closeAcctModal() {
+  const modal = document.getElementById("acct-modal");
+  if (modal) modal.hidden = true;
+}
+function openAcctModal(title, html) {
+  document.getElementById("acct-modal-title").textContent = title || "账号信息";
+  document.getElementById("acct-modal-body").innerHTML = html;
+  document.getElementById("acct-modal").hidden = false;
+}
+function renderAccounts(data) {
+  const counts = data.counts || {};
+  document.getElementById("acct-kpi-total").textContent = counts.total ?? data.total ?? 0;
+  document.getElementById("acct-kpi-clean").textContent = counts.clean ?? 0;
+  document.getElementById("acct-kpi-unknown").textContent = counts.unknown ?? 0;
+  document.getElementById("acct-kpi-flagged").textContent = counts.flagged ?? 0;
+  document.getElementById("acct-kpi-uploaded").textContent = counts.uploaded ?? 0;
+  document.getElementById("acct-kpi-pending").textContent = counts.not_uploaded ?? 0;
+  acctPage = data.page || 1;
+  document.getElementById("acct-page-label").textContent = (data.page || 1) + " / " + (data.pages || 1) + " · " + (data.total || 0);
+  const body = document.getElementById("acct-body");
+  const items = data.items || [];
+  if (!items.length) {
+    body.innerHTML = `<tr><td colspan="8" class="domain-empty">没有匹配的账号</td></tr>`;
+    return;
+  }
+  body.innerHTML = items.map(it => {
+    const up = it.uploaded ? `<span class="acct-badge ok">已上传</span>` : `<span class="acct-badge">未上传${it.upload_skipped ? " · 已跳过" : ""}</span>`;
+    const sub = riskDetailLine(it);
+    return `<tr>
+      <td class="acct-check-col"><input type="checkbox" class="acct-row" value="${esc(it.email)}"/></td>
+      <td class="mono">${esc(it.email)}</td>
+      <td><div class="acct-risk">${riskBadge(it.risk_status)}${sub ? `<div class="acct-risk-detail" title="${esc(sub)}">${esc(sub)}</div>` : ""}</div></td>
+      <td>${up}</td>
+      <td>${it.uploaded_web ? "是" : "-"}</td>
+      <td>${it.uploaded_build ? "是" : "-"}</td>
+      <td class="mono">${esc(formatBeijing(it.created_at))}</td>
+      <td class="proxy-actions">
+        <button onclick='viewAccount(${JSON.stringify(it.email)})'>查看</button>
+        <button onclick='accountsBatch("detect", [${JSON.stringify(it.email)}])'>风控</button>
+        <button onclick='accountsBatch("upload", [${JSON.stringify(it.email)}])'>上传</button>
+        <button class="danger" onclick='deleteSelectedAccounts([${JSON.stringify(it.email)}])'>删除</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+function showAccountJobResult(job) {
+  const items = job.items || [];
+  if (!items.length) return;
+  const kind = job.kind === "detect" ? "风控检测结果" : (job.kind === "upload" ? "补上传结果" : "任务结果");
+  const rows = items.map(it => {
+    let badge = riskBadge(it.risk_status);
+    if (job.kind === "detect") {
+      if (it.flagged || it.risk_status === "flagged") badge = riskBadge("flagged");
+      else if (it.ok && it.risk_status === "clean") badge = riskBadge("clean");
+      else if (!it.ok || it.risk_status === "unknown") badge = riskBadge("unknown");
+    } else {
+      badge = it.ok ? `<span class="acct-badge ok">成功</span>` : `<span class="acct-badge fail">失败</span>`;
+    }
+    return `<div class="acct-result-row">
+      <div><div class="acct-result-email">${esc(it.email)}</div><div class="acct-result-detail">${esc(it.detail || "")}</div></div>
+      <div>${badge}</div>
+    </div>`;
+  }).join("");
+  openAcctModal(kind, `<p>完成 ${job.done || 0}/${job.total || 0} · 成功 ${job.ok || 0} · 失败 ${job.failed || 0}</p><div class="acct-result-list">${rows}</div>`);
+}
+async function loadAccounts(page) {
+  const next = Math.max(1, Number(page) || 1);
+  const params = new URLSearchParams({
+    q: document.getElementById("acct-q").value || "",
+    risk_status: document.getElementById("acct-risk").value || "",
+    uploaded: document.getElementById("acct-uploaded").value || "",
+    sort: document.getElementById("acct-sort").value || "created_at",
+    page: String(next),
+    page_size: String(Math.min(500, Math.max(1, Number(document.getElementById("acct-page-size").value) || 20))),
+  });
+  try {
+    const data = await api("/api/accounts?" + params.toString());
+    renderAccounts(data);
+    const job = data.job || {};
+    document.getElementById("accounts-job").textContent = job.running
+      ? ((job.kind === "detect" ? "检测中" : (job.kind === "upload" ? "上传中" : "任务")) + " " + (job.done || 0) + "/" + (job.total || 0))
+      : ("共 " + (data.total || 0) + " 个");
+    if (job.running) {
+      clearTimeout(acctTimer);
+      acctTimer = setTimeout(() => loadAccounts(acctPage), 1500);
+    } else if (job.kind && (job.items || []).length) {
+      const sig = [job.kind, job.done, job.ok, job.failed, (job.items || []).length].join(":");
+      if (sig !== acctLastJobSig) {
+        acctLastJobSig = sig;
+        showAccountJobResult(job);
+      }
+    }
+  } catch (e) {
+    setMsg("acct-msg", String(e.message || e), "err");
+  }
+}
+async function viewAccount(email) {
+  openAcctModal("账号信息", "读取中…");
+  try {
+    const data = await api("/api/accounts/detail?email=" + encodeURIComponent(email));
+    const it = data.item || {};
+    const risk = riskLabel(it.risk_status) + (it.risk_detail ? " · " + it.risk_detail : "");
+    document.getElementById("acct-modal-body").innerHTML = `<dl class="acct-modal-dl">
+      <dt>邮箱</dt><dd class="mono">${esc(it.email || "")}</dd>
+      <dt>密码</dt><dd class="mono">${esc(it.password || "")}</dd>
+      <dt>SSO</dt><dd class="mono">${esc(it.sso || "")}</dd>
+      <dt>风控</dt><dd>${riskBadge(it.risk_status)}<div class="acct-result-detail">${esc(riskDetailLine(it) || it.risk_detail || risk)}</div></dd>
+      <dt>检测时间</dt><dd>${esc(formatBeijing(it.risk_checked_at))}</dd>
+      <dt>注册时间</dt><dd>${esc(formatBeijing(it.created_at))}</dd>
+      <dt>更新时间</dt><dd>${esc(formatBeijing(it.updated_at))}</dd>
+      <dt>上传</dt><dd>${it.uploaded ? "已上传" : "未上传"}${it.upload_skipped ? "（曾因风控未确认跳过）" : ""}</dd>
+      <dt>渠道</dt><dd>Web ${it.uploaded_web ? "是" : "否"} / Build ${it.uploaded_build ? "是" : "否"} / Console ${it.uploaded_console ? "是" : "否"}</dd>
+      <dt>Token</dt><dd>${esc(formatBeijing(it.token_exp))}${it.token_expired ? "（已过期，补上传会用 SSO 换新 token）" : ""}</dd>
+    </dl>`;
+  } catch (e) {
+    document.getElementById("acct-modal-body").textContent = String(e.message || e);
+  }
+}
+async function importAccountFiles() {
+  try {
+    const data = await api("/api/accounts/import", { method: "POST", body: "{}" });
+    setMsg("acct-msg", "已扫描 " + (data.imported || 0) + " 个账号文件", "ok");
+    loadAccounts(1);
+  } catch (e) { setMsg("acct-msg", String(e.message || e), "err"); }
+}
+async function accountsBatch(kind, emails) {
+  const list = emails && emails.length ? emails : selectedAccountEmails();
+  if (!list.length) { setMsg("acct-msg", "请先勾选账号", "err"); return; }
+  try {
+    acctLastJobSig = "";
+    await api("/api/accounts/" + kind, { method: "POST", body: JSON.stringify({ emails: list }) });
+    setMsg("acct-msg", (kind === "upload" ? "正在补上传 " : "正在检测风控 ") + list.length + " 个…", "ok");
+    loadAccounts(acctPage);
+  } catch (e) { setMsg("acct-msg", String(e.message || e), "err"); }
+}
+async function deleteSelectedAccounts(emails) {
+  const list = emails && emails.length ? emails : selectedAccountEmails();
+  if (!list.length) { setMsg("acct-msg", "请先勾选要删除的账号", "err"); return; }
+  if (!window.confirm("确认删除 " + list.length + " 个账号？将同时去掉账号文件。")) return;
+  try {
+    const data = await api("/api/accounts/delete", { method: "POST", body: JSON.stringify({ emails: list }) });
+    setMsg("acct-msg", "已删除 " + (data.deleted || 0) + " 个", "ok");
+    closeAcctModal();
+    loadAccounts(1);
+  } catch (e) { setMsg("acct-msg", String(e.message || e), "err"); }
 }
 function formatIcloudTime(value) {
   if (!value) return "未计划";
@@ -3745,11 +4168,12 @@ async function refresh() {
 }
 function fillControl(d) {
   const c = d.control || {};
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode"].includes(document.activeElement.id)) return;
+  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode","account_interval"].includes(document.activeElement.id)) return;
   if (c.workers != null) document.getElementById("workers-input").value = c.workers;
   if (c.batch_count != null) document.getElementById("batch_count").value = c.batch_count;
   if (c.add_count != null && document.getElementById("add_count")) document.getElementById("add_count").value = c.add_count;
   if (c.risk_pause != null) document.getElementById("risk_pause").value = c.risk_pause;
+  if (c.account_interval != null && document.getElementById("account_interval")) document.getElementById("account_interval").value = c.account_interval;
   if (c.mode) document.getElementById("mode").value = c.mode;
 }
 function controlBody() {
@@ -3758,6 +4182,7 @@ function controlBody() {
     batch_count: Number(document.getElementById("batch_count").value || 40),
     add_count: Number((document.getElementById("add_count") || {}).value || 40),
     risk_pause: Number(document.getElementById("risk_pause").value || 10),
+    account_interval: (document.getElementById("account_interval") || {}).value || "0",
     mode: document.getElementById("mode").value || "orch",
   };
 }
@@ -4488,7 +4913,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/icloud-auto-create", "/api/icloud-inventory", "/api/delivery"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/icloud-auto-create", "/api/icloud-inventory", "/api/delivery") or u.path.startswith("/api/accounts"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4549,6 +4974,43 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, read_delivery_config())
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts":
+            try:
+                qs = parse_qs(u.query)
+
+                def _q(name, default=""):
+                    vals = qs.get(name) or [default]
+                    return str(vals[0] if vals else default)
+
+                data = list_accounts(
+                    query=_q("q"),
+                    risk_status=_q("risk_status"),
+                    uploaded=_q("uploaded"),
+                    sort=_q("sort", "updated_at"),
+                    order=_q("order", "desc"),
+                    page=int(_q("page", "1") or 1),
+                    page_size=min(500, max(1, int(_q("page_size", "20") or 20))),
+                )
+                data["job"] = accounts_job_status()
+                self._json(200, data)
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/detail":
+            try:
+                qs = parse_qs(u.query)
+                email = str((qs.get("email") or [""])[0] or "")
+                item = get_account(email, secrets=True)
+                if not item:
+                    self._json(404, {"ok": False, "error": "账号不存在"})
+                    return
+                self._json(200, {"ok": True, "item": item})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/job":
+            self._json(200, {"ok": True, **accounts_job_status()})
             return
         if u.path == "/api/email-domains":
             try:
@@ -4701,6 +5163,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/import":
+            try:
+                n = import_account_files()
+                self._json(200, {"ok": True, "imported": n})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/upload":
+            try:
+                result = start_accounts_batch("upload", body.get("emails") or [])
+                self._json(200, {"ok": True, **result})
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/delete":
+            try:
+                result = delete_accounts(body.get("emails") or [])
+                self._json(200, result)
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
+            return
+        if u.path == "/api/accounts/detect":
+            try:
+                result = start_accounts_batch("detect", body.get("emails") or [])
+                self._json(200, {"ok": True, **result})
+            except Exception as e:
+                self._json(400, {"ok": False, "error": redact_log_line(str(e))})
             return
         if u.path == "/api/delivery/test":
             try:

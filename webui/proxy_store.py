@@ -836,11 +836,17 @@ def record_proxy_result(url: object, outcome: str, error: object = "") -> bool:
                 item["last_error"] = ""
                 item["cooldown_until"] = ""
                 item["cooldown_reason"] = ""
-            elif outcome == "risk" and is_home_proxy(item.get("url") or normalized):
-                # 家宽风控：只记账，不冷却、不禁用；换口靠 40 分钟 IP 去重
-                item["risk_count"] += 1
+            elif outcome in {"risk", "network"} and (
+                is_home_proxy(item.get("url") or normalized)
+                or is_sticky_template(item.get("url") or normalized)
+            ):
+                # 家宽 / 动态粘性：只记账，不冷却。每个号出口不同，本机 profile/浏览器失败更不能冻整条。
                 item["failure_count"] += 1
-                item["last_error"] = _clean_text(error) or "运行时风控"
+                item["last_error"] = _clean_text(error) or (
+                    "运行时风控" if outcome == "risk" else "运行时网络异常"
+                )
+                if outcome == "risk":
+                    item["risk_count"] += 1
                 if item.get("status") == "cooldown":
                     item["status"] = "healthy" if item.get("exit_ip") else "unknown"
                 item["cooldown_until"] = ""

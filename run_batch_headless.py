@@ -4,6 +4,10 @@ import os
 
 os.chdir(str(Path(__file__).resolve().parent))
 
+from runtime_platform import apply_runtime_tmpdir
+
+apply_runtime_tmpdir()
+
 import json
 import secrets
 import sys

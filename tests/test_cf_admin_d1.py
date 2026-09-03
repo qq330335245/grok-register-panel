@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import time
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -221,6 +222,43 @@ def test_cloudflare_wait_skips_detail_when_raw_present():
     assert all("/api/mail/" not in url for url in calls)
 
 
+def test_icloud_wait_uses_inbucket_not_cf():
+    cf_calls = []
+    logs = []
+
+    def fake_cf(*_a, **_k):
+        cf_calls.append(1)
+        return []
+
+    mails = [
+        {
+            "id": "20260902T190027-0350",
+            "subject": "SpaceXAI confirmation code: 111-222",
+            "raw": "X-ICLOUD-HME: p=alias@icloud.com; f=apple2@konsin.de5.net\n\ncode 111-222",
+            "text": "111-222",
+            "header": {
+                "X-Icloud-Hme": ["p=alias@icloud.com; d=; f=apple2@konsin.de5.net"]
+            },
+            "created_at": time.time(),
+        }
+    ]
+
+    with patch.object(icloud.cf_admin_provider, "list_forward_mailbox_mails", fake_cf), patch.object(
+        icloud.inbucket_provider, "list_forward_mails", lambda *_a, **_k: mails
+    ):
+        code = icloud.wait_for_verification_code(
+            "alias@icloud.com",
+            temp_mail_target="apple2@konsin.de5.net",
+            inbucket_api_base="http://127.0.0.1:9000",
+            http_get=lambda *_a, **_k: None,
+            timeout=10,
+            log_callback=logs.append,
+        )
+    assert code == "111-222"
+    assert cf_calls == []
+    assert any("Inbucket" in line for line in logs)
+
+
 def test_icloud_empty_forward_does_not_query_alias():
     admin_calls = []
 
@@ -258,4 +296,5 @@ if __name__ == "__main__":
     test_wait_for_code_skips_detail_when_raw_present()
     test_cloudflare_wait_skips_detail_when_raw_present()
     test_icloud_empty_forward_does_not_query_alias()
+    test_icloud_wait_uses_inbucket_not_cf()
     print("ok")

@@ -20,6 +20,9 @@ def test_defaults_are_bounded_and_overridable():
     assert retry_policy.browser_start_attempts({"GROK_BROWSER_START_ATTEMPTS": "99"}) == 4
     assert retry_policy.proxy_boot_rotations({"GROK_PROXY_BOOT_ROTATIONS": "-4"}) == 0
     assert retry_policy.slot_retries({"GROK_SLOT_RETRIES": "invalid"}) == 1
+    assert retry_policy.risk_streak_wait_start({}) == 2
+    assert retry_policy.risk_streak_stop({}) == 5
+    assert retry_policy.risk_streak_wait_base({}) == 30
 
 
 def test_xai_failure_is_explicitly_non_retryable():

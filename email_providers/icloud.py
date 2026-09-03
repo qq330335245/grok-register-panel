@@ -7,7 +7,8 @@ Modes for obtaining a register address:
 3) Create new HME alias only when inventory has no free aliases
 Cloud note tags remain cross-device truth; local inventory is same-machine SoT.
 
-Receive codes via Cloudflare Temp-Mail admin inbox (HME forward target).
+Receive codes via the HME forward mailbox. Prefer local Inbucket after the
+CF worker stopped writing D1; fall back to Cloudflare Temp-Mail admin API.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from email_providers import cf_admin as cf_admin_provider
+from email_providers import inbucket as inbucket_provider
 from email_providers import icloud_hme as hme
 from email_providers.common import extract_verification_code
 from email_providers import icloud_note_tags as note_tags
@@ -445,6 +447,8 @@ def check_health(
     temp_mail_base: str = "",
     temp_mail_password: str = "",
     temp_mail_custom_auth: str = "",
+    temp_mail_target: str = "",
+    inbucket_api_base: str = "",
     used_file: str = "",
     platform: str = DEFAULT_PLATFORM,
     use_local_used: bool = False,
@@ -480,6 +484,22 @@ def check_health(
         hme_ok = True
     except Exception as exc:
         return False, f"HME cookies 无效/过期: {exc}"
+
+    inbucket_base = inbucket_provider.normalize_base(inbucket_api_base)
+    target = _norm_email(temp_mail_target)
+    if inbucket_base:
+        if not target:
+            return False, "; ".join(parts) + "; 未配置 icloud_temp_mail_target"
+        if http_get is None:
+            parts.append(f"inbucket 配置存在 mailbox={target}")
+            return True, "; ".join(parts)
+        try:
+            mails = inbucket_provider.list_messages(http_get, inbucket_base, target)
+            parts.append(f"inbucket OK mailbox={target} n={len(mails)}")
+            return True, "; ".join(parts)
+        except Exception as exc:
+            parts.append(f"inbucket FAIL: {exc}")
+            return False, "; ".join(parts)
 
     base = str(temp_mail_base or "").rstrip("/")
     password = str(temp_mail_password or "").strip()
@@ -559,6 +579,7 @@ def wait_for_verification_code(
     temp_mail_password: str = "",
     temp_mail_target: str = "",
     temp_mail_custom_auth: str = "",
+    inbucket_api_base: str = "",
     http_get: Optional[HttpGet] = None,
     timeout: int = 180,
     poll_interval: float = 8.0,
@@ -572,7 +593,9 @@ def wait_for_verification_code(
 ) -> str:
     """Poll shared forward inbox and match mails by X-ICLOUD-HME p=<alias>.
 
-    Real raw key from D1:
+    Prefer Inbucket when configured (CF Email Worker now ingests there and
+    skips D1). Otherwise use Cloudflare Temp-Mail /admin/mails.
+
       X-ICLOUD-HME: p=alias@icloud.com; d=; f=forward@example.com; r=to; s=noreply@x.ai
     """
     _ = cookies_raw, inventory_path, platform
@@ -585,10 +608,11 @@ def wait_for_verification_code(
     password = str(temp_mail_password or "").strip()
     forward = _norm_email(temp_mail_target)
     custom_auth = str(temp_mail_custom_auth or "").strip()
-    if not base or not password:
-        raise Exception("未配置 icloud_temp_mail_base / icloud_temp_mail_password")
+    inbucket_base = inbucket_provider.normalize_base(inbucket_api_base)
     if not forward:
         raise Exception("未配置 icloud_temp_mail_target（HME 转发箱）")
+    if not inbucket_base and (not base or not password):
+        raise Exception("未配置 icloud_temp_mail_base / icloud_temp_mail_password")
 
     sent_at = float(otp_sent_at or 0.0) or time.time()
     deadline = time.time() + max(int(timeout or 180), 10)
@@ -597,10 +621,29 @@ def wait_for_verification_code(
     poll = 0
     last_mail_key = f"lastmail:{alias}"
     last_status = ""
+    logged_backend = False
 
     def _log(msg: str) -> None:
         if log_callback:
             log_callback(msg)
+
+    def _load_forward_mails() -> List[dict]:
+        if inbucket_base:
+            return inbucket_provider.list_forward_mails(
+                http_get,
+                inbucket_base,
+                forward,
+                limit=cf_admin_provider.FORWARD_MAIL_LIST_LIMIT,
+            )
+        # Address-filtered forward inbox. Empty result means no mail yet;
+        # do not also query the alias (second COUNT on D1).
+        return cf_admin_provider.list_forward_mailbox_mails(
+            http_get,
+            base,
+            forward_email=forward,
+            admin_password=password,
+            custom_auth=custom_auth,
+        )
 
     while time.time() < deadline:
         if cancel_callback and cancel_callback():
@@ -608,32 +651,28 @@ def wait_for_verification_code(
         poll += 1
         raw_mails: List[dict] = []
         fetch_error = ""
+        if inbucket_base and not logged_backend:
+            _log(f"[*] iCloud 验证码走 Inbucket mailbox={forward}")
+            logged_backend = True
         try:
-            # Address-filtered forward inbox. Empty result means no mail yet;
-            # do not also query the alias (second COUNT on D1).
-            raw_mails = cf_admin_provider.list_forward_mailbox_mails(
-                http_get,
-                base,
-                forward_email=forward,
-                admin_password=password,
-                custom_auth=custom_auth,
-            )
+            raw_mails = _load_forward_mails()
         except Exception as exc:
             fetch_error = str(exc)
             if poll == 1 or poll % 4 == 1:
                 _log(f"[Debug] iCloud temp_mail 拉信失败: {exc}")
-            try:
-                raw_mails = cf_admin_provider.list_admin_mails(
-                    http_get,
-                    base,
-                    admin_password=password,
-                    custom_auth=custom_auth,
-                    address=alias,
-                    preferred_limit=cf_admin_provider.MAIL_LIST_LIMIT,
-                )
-                raw_mails = [m for m in raw_mails if isinstance(m, dict)]
-            except Exception:
-                raw_mails = []
+            if not inbucket_base:
+                try:
+                    raw_mails = cf_admin_provider.list_admin_mails(
+                        http_get,
+                        base,
+                        admin_password=password,
+                        custom_auth=custom_auth,
+                        address=alias,
+                        preferred_limit=cf_admin_provider.MAIL_LIST_LIMIT,
+                    )
+                    raw_mails = [m for m in raw_mails if isinstance(m, dict)]
+                except Exception:
+                    raw_mails = []
             if not raw_mails:
                 _sleep(cf_admin_provider.next_poll_sleep(poll_interval, poll - 1), cancel_callback)
                 continue
@@ -790,13 +829,7 @@ def wait_for_verification_code(
 
     # Final diagnostic snapshot (still no increase of timeout).
     try:
-        final_mails = cf_admin_provider.list_forward_mailbox_mails(
-            http_get,
-            base,
-            forward_email=forward,
-            admin_password=password,
-            custom_auth=custom_auth,
-        )
+        final_mails = _load_forward_mails()
     except Exception as exc:
         final_mails = []
         _log(f"[Debug] 超时前拉信快照失败: {exc}")

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -262,6 +263,49 @@ def resolve_playwright_node(
         environ=env,
         which=which,
     )
+
+
+def runtime_tmpdir(
+    *,
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Persistent temp dir. systemd PrivateTmp /tmp disappears for leftover children."""
+    env = os.environ if environ is None else environ
+    override = str(env.get("GROK_TMPDIR", "") or "").strip()
+    if override:
+        path = Path(override).expanduser()
+    elif _platform_name(platform_name).startswith("win"):
+        local = str(env.get("LOCALAPPDATA", "") or "").strip()
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        path = base / "GrokRegister" / "tmp"
+    else:
+        home = str(env.get("HOME", "") or "").strip()
+        base = Path(home).expanduser() if home else Path.home()
+        path = base / ".cache" / "grok-register-tmp"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def apply_runtime_tmpdir(
+    environ: dict[str, str] | None = None,
+    *,
+    platform_name: str | None = None,
+) -> Path:
+    env = os.environ if environ is None else environ
+    path = runtime_tmpdir(platform_name=platform_name, environ=env)
+    text = str(path)
+    env["TMPDIR"] = text
+    env["TEMP"] = text
+    env["TMP"] = text
+    env.setdefault("GROK_TMPDIR", text)
+    if environ is None:
+        tempfile.tempdir = text
+    return path
 
 
 def apply_playwright_node_env(

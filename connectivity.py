@@ -279,19 +279,23 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
             base = str(config.get("icloud_temp_mail_base") or "").strip()
             password = str(config.get("icloud_temp_mail_password") or "").strip()
             target = str(config.get("icloud_temp_mail_target") or "").strip()
+            inbucket_base = str(config.get("inbucket_api_base") or "").strip()
             if not cookies:
                 return "邮箱API", False, "未配置 icloud_cookies"
-            if not base:
-                return "邮箱API", False, "未配置 icloud_temp_mail_base"
-            if not password:
-                return "邮箱API", False, "未配置 icloud_temp_mail_password"
             if not target:
                 return "邮箱API", False, "未配置 icloud_temp_mail_target"
+            if not inbucket_base:
+                if not base:
+                    return "邮箱API", False, "未配置 icloud_temp_mail_base"
+                if not password:
+                    return "邮箱API", False, "未配置 icloud_temp_mail_password"
             ok, detail = icloud_provider.check_health(
                 cookies_raw=cookies,
                 temp_mail_base=base,
                 temp_mail_password=password,
                 temp_mail_custom_auth=str(config.get("icloud_temp_mail_custom_auth") or ""),
+                temp_mail_target=target,
+                inbucket_api_base=inbucket_base,
                 platform=str(config.get("icloud_platform_tag") or "grok"),
                 http_get=http_get,
             )

@@ -16,13 +16,34 @@ from runtime_platform import (
     RuntimePlatformError,
     _load_beijing_timezone,
     apply_playwright_node_env,
+    apply_runtime_tmpdir,
     batch_launch_command,
     batch_runtime_error,
     popen_group_kwargs,
     resolve_playwright_node,
     resolve_real_node_binary,
     runtime_python,
+    runtime_tmpdir,
 )
+
+
+def test_runtime_tmpdir_uses_override_and_pins_env():
+    with tempfile.TemporaryDirectory() as temp:
+        target = Path(temp) / "pinned-tmp"
+        env = {"GROK_TMPDIR": str(target)}
+        path = apply_runtime_tmpdir(env, platform_name="linux")
+        assert path == target
+        assert target.is_dir()
+        assert env["TMPDIR"] == str(target)
+        assert env["TEMP"] == str(target)
+        assert env["TMP"] == str(target)
+        home = Path(temp) / "home"
+        posix = runtime_tmpdir(
+            platform_name="linux",
+            environ={"HOME": str(home)},
+        )
+        assert posix == home / ".cache" / "grok-register-tmp"
+        assert posix.is_dir()
 
 
 def test_beijing_timezone_falls_back_without_system_tzdata():
@@ -274,6 +295,7 @@ def test_recovery_module_can_run_from_webui_directory():
 
 
 if __name__ == "__main__":
+    test_runtime_tmpdir_uses_override_and_pins_env()
     test_beijing_timezone_falls_back_without_system_tzdata()
     test_runtime_python_uses_platform_virtualenv_layout()
     test_runtime_python_falls_back_to_active_interpreter()

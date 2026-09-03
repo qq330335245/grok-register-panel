@@ -606,11 +606,13 @@ def _is_configured(provider: str, values: dict) -> bool:
     if provider == "inbucket":
         return bool(values.get("inbucket_api_base") and values.get("inbucket_domain"))
     if provider == "icloud":
+        if not values.get("icloud_cookies") or not values.get("icloud_temp_mail_target"):
+            return False
+        if values.get("inbucket_api_base"):
+            return True
         return bool(
-            values.get("icloud_cookies")
-            and values.get("icloud_temp_mail_base")
+            values.get("icloud_temp_mail_base")
             and values.get("icloud_temp_mail_password")
-            and values.get("icloud_temp_mail_target")
         )
     return False
 

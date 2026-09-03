@@ -13,7 +13,7 @@ import re
 import string
 import threading
 import time
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
 from email_providers.common import extract_verification_code, generate_username
@@ -182,6 +182,82 @@ def get_message_detail(
         preview = str(getattr(resp, "text", "") or "")[:300]
         raise Exception(f"Inbucket 获取邮件详情返回非 JSON: {preview}") from exc
     return data if isinstance(data, dict) else {}
+
+
+def _header_raw(header: Any) -> str:
+    if not isinstance(header, dict):
+        return ""
+    lines: List[str] = []
+    for key, value in header.items():
+        if isinstance(value, list):
+            for item in value:
+                lines.append(f"{key}: {item}")
+        elif value is not None:
+            lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def mail_from_inbucket_detail(detail: dict, *, list_item: Optional[dict] = None) -> dict:
+    """Normalize Inbucket JSON into the CF-like dict iCloud HME matching expects."""
+    item = list_item if isinstance(list_item, dict) else {}
+    header = detail.get("header") if isinstance(detail.get("header"), dict) else {}
+    body = detail.get("body") if isinstance(detail.get("body"), dict) else {}
+    text = str(body.get("text") or "")
+    html = body.get("html") or ""
+    raw = _header_raw(header)
+    if text:
+        raw = f"{raw}\n\n{text}" if raw else text
+    created = 0.0
+    millis = detail.get("posix-millis") or item.get("posix-millis")
+    try:
+        if millis is not None and str(millis).strip() != "":
+            num = float(millis)
+            created = num / 1000.0 if num > 1e12 else num
+    except Exception:
+        created = 0.0
+    return {
+        "id": str(detail.get("id") or item.get("id") or "").strip(),
+        "subject": str(detail.get("subject") or item.get("subject") or ""),
+        "header": header,
+        "text": text,
+        "html": html,
+        "raw": raw,
+        "date": str(detail.get("date") or item.get("date") or ""),
+        "created_at": created,
+    }
+
+
+def list_forward_mails(
+    http_get: HttpGet,
+    base_url: str,
+    address: str,
+    *,
+    limit: int = 40,
+) -> List[dict]:
+    """List a shared forward mailbox (full address) with headers for HME matching.
+
+    Do not purge this mailbox: iCloud aliases share one Inbucket inbox.
+    """
+    messages = list_messages(http_get, base_url, address)
+    if not messages:
+        return []
+    try:
+        cap = max(1, int(limit or 40))
+    except Exception:
+        cap = 40
+    out: List[dict] = []
+    for msg in messages[:cap]:
+        if not isinstance(msg, dict):
+            continue
+        mid = str(msg.get("id") or "").strip()
+        if not mid:
+            continue
+        try:
+            detail = get_message_detail(http_get, base_url, address, mid)
+        except Exception:
+            detail = dict(msg)
+        out.append(mail_from_inbucket_detail(detail, list_item=msg))
+    return out
 
 
 def purge_mailbox(http_delete: Optional[HttpDelete], base_url: str, address: str) -> None:

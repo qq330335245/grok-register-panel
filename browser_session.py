@@ -27,8 +27,9 @@ def _pin_playwright_node() -> None:
     EPIPE guard，避免把 bash 包装脚本交给 CreateProcess。
     必须在 import playwright / camoufox 之前设置。
     """
-    from runtime_platform import apply_playwright_node_env
+    from runtime_platform import apply_playwright_node_env, apply_runtime_tmpdir
 
+    apply_runtime_tmpdir()
     apply_playwright_node_env()
 
 
@@ -501,12 +502,17 @@ def _profile_root(
 ) -> Path:
     platform = os.name if platform_name is None else str(platform_name)
     source = os.environ if environ is None else environ
+    override = str(source.get("GROK_PROFILE_ROOT", "") or "").strip()
+    if override:
+        return ensure_private_dir(Path(override))
     if platform == "nt":
         local_app_data = str(source.get("LOCALAPPDATA", "") or "").strip()
         base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
         return ensure_private_dir(base / "GrokRegister" / _PROFILE_ROOT_MARKER)
-    base = temp_root if temp_root is not None else tempfile.gettempdir()
-    return ensure_private_dir(Path(base) / _PROFILE_ROOT_MARKER)
+    # systemd PrivateTmp 会卸掉服务私有 /tmp；profile 放到 HOME，避免下号找不到目录。
+    if temp_root is not None:
+        return ensure_private_dir(Path(temp_root) / _PROFILE_ROOT_MARKER)
+    return ensure_private_dir(Path.home() / ".cache" / _PROFILE_ROOT_MARKER)
 
 
 def _rmtree_with_retry(path: str, max_retries: int = 3, delay: float = 0.5) -> bool:

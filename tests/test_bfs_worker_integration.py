@@ -11,27 +11,29 @@ sys.path.insert(0, str(ROOT))
 import grok_register_ttk as register
 
 
-def test_unknown_bfs_is_queued_when_skip_enabled():
+def _clear_tls():
+    register._proxy_tls.build_token = None
+    register._proxy_tls.bot_risk_checked = False
+
+
+def test_thinking_flagged_in_cpa_path_raises():
+    _clear_tls()
     config_keys = (
         "cpa_auto_add",
         "cpa_auth_dir",
         "cpa_remote_url",
         "cpa_management_key",
         "grok2api_auth_dir",
-        "bfs_check",
-        "bfs_skip_cpa",
         "cpa_token_mode",
     )
     previous_config = {key: register.config.get(key) for key in config_keys}
     previous_functions = (
         register._resolve_cpa_proxy,
         register._s2cpa.sso_to_token,
-        register._s2cpa.inspect_token_bundle_bfs,
-        register._s2cpa.token_to_cpa_record,
-        register._append_sso_pending,
+        register._run_build_thinking_probe,
+        register._append_sso_risk_rejected,
+        register.record_register_result,
     )
-    queued = []
-    record_calls = []
     with tempfile.TemporaryDirectory() as temp:
         register.config.update(
             {
@@ -40,8 +42,6 @@ def test_unknown_bfs_is_queued_when_skip_enabled():
                 "cpa_remote_url": "",
                 "cpa_management_key": "",
                 "grok2api_auth_dir": "",
-                "bfs_check": True,
-                "bfs_skip_cpa": True,
                 "cpa_token_mode": "device_protocol",
             }
         )
@@ -50,43 +50,39 @@ def test_unknown_bfs_is_queued_when_skip_enabled():
             "access_token": "opaque-access-token",
             "refresh_token": "opaque-refresh-token",
         }
-        register._s2cpa.inspect_token_bundle_bfs = lambda **_kwargs: {
-            "ok": False,
-            "has_bfs": False,
-            "bfs": None,
-            "source": "",
+        register._run_build_thinking_probe = lambda *_a, **_k: {
+            "ok": True,
+            "flagged": True,
+            "source": 2,
+            "reason": "no thinking on 2 sticky exits",
         }
-        register._s2cpa.token_to_cpa_record = (
-            lambda *_args, **kwargs: record_calls.append(kwargs) or {}
-        )
-        register._append_sso_pending = (
-            lambda email, sso, **_kwargs: queued.append((email, sso))
-        )
+        register._append_sso_risk_rejected = lambda *_a, **_k: None
+        register.record_register_result = lambda *_a, **_k: {}
         try:
-            result = register.add_sso_to_cpa(
-                "sso=test-sso-token",
-                email="unknown@example.test",
-            )
+            try:
+                register.add_sso_to_cpa("sso=test-sso-token", email="risk@example.test")
+            except register.RegistrationRiskDenied:
+                blocked = True
+            else:
+                blocked = False
         finally:
             (
                 register._resolve_cpa_proxy,
                 register._s2cpa.sso_to_token,
-                register._s2cpa.inspect_token_bundle_bfs,
-                register._s2cpa.token_to_cpa_record,
-                register._append_sso_pending,
+                register._run_build_thinking_probe,
+                register._append_sso_risk_rejected,
+                register.record_register_result,
             ) = previous_functions
             for key, value in previous_config.items():
                 if value is None:
                     register.config.pop(key, None)
                 else:
                     register.config[key] = value
-
-    assert result is False
-    assert queued == [("unknown@example.test", "test-sso-token")]
-    assert record_calls == []
+    assert blocked is True
 
 
 def test_grok2api_web_uploads_before_cpa_write():
+    _clear_tls()
     order = []
     config_keys = (
         "cpa_auto_add",
@@ -107,6 +103,7 @@ def test_grok2api_web_uploads_before_cpa_write():
     previous = (
         register._resolve_cpa_proxy,
         register._s2cpa.sso_to_token,
+        register._run_build_thinking_probe,
         register._s2cpa.token_to_cpa_record,
         register._s2cpa.write_cpa_auth,
         register._s2cpa.write_grok2api_auth,
@@ -137,6 +134,12 @@ def test_grok2api_web_uploads_before_cpa_write():
             "access_token": "opaque-access-token",
             "refresh_token": "opaque-refresh-token",
         }
+        register._run_build_thinking_probe = lambda *_a, **_k: {
+            "ok": True,
+            "flagged": False,
+            "source": 0,
+            "reason": "thinking",
+        }
         register._s2cpa.token_to_cpa_record = lambda *_a, **_k: {
             "access_token": "opaque-access-token",
             "refresh_token": "opaque-refresh-token",
@@ -165,6 +168,7 @@ def test_grok2api_web_uploads_before_cpa_write():
             (
                 register._resolve_cpa_proxy,
                 register._s2cpa.sso_to_token,
+                register._run_build_thinking_probe,
                 register._s2cpa.token_to_cpa_record,
                 register._s2cpa.write_cpa_auth,
                 register._s2cpa.write_grok2api_auth,
@@ -182,6 +186,6 @@ def test_grok2api_web_uploads_before_cpa_write():
 
 
 if __name__ == "__main__":
-    test_unknown_bfs_is_queued_when_skip_enabled()
+    test_thinking_flagged_in_cpa_path_raises()
     test_grok2api_web_uploads_before_cpa_write()
     print("OK bfs worker integration")

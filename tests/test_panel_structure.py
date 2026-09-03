@@ -11,6 +11,17 @@ def test_workers_dom_ids_unique():
     assert 'id="delivery-view-toggle"' in mon
     assert 'id="delivery-g2a-url"' in mon
     assert '/api/delivery' in mon
+    assert 'id="accounts-view-toggle"' in mon
+    assert 'id="accounts-view"' in mon
+    assert '/api/accounts' in mon
+    assert 'upload_when_risk_unknown' in mon
+    assert 'function loadAccounts(' in mon
+    assert 'id="acct-modal"' in mon
+    assert '/api/accounts/delete' in mon
+    assert '创建时间' in mon
+    assert 'function formatBeijing(' in mon
+    assert 'timeZone: "Asia/Shanghai"' in mon
+    assert '.replace("Z", "")' not in mon.split('function renderAccounts')[1].split('async function viewAccount')[0]
 
 def test_no_cors_wildcard():
     mon = (ROOT / 'webui/monitor.py').read_text(encoding='utf-8')

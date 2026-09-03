@@ -213,6 +213,38 @@ def test_wait_for_code_requires_base():
         raise AssertionError("expected base error")
 
 
+def test_list_forward_mails_preserves_hme_header():
+    from email_providers import cf_admin
+
+    def http_get(url, **kwargs):
+        if url.endswith("/mailbox/apple2%40konsin.de5.net"):
+            return FakeResponse(
+                [{"id": "20260902T190027-0350", "subject": "SpaceXAI confirmation code: 436-015"}]
+            )
+        return FakeResponse(
+            {
+                "id": "20260902T190027-0350",
+                "subject": "SpaceXAI confirmation code: 436-015",
+                "header": {
+                    "X-Icloud-Hme": [
+                        "p=mics-vital0p@icloud.com; d=; f=apple2@konsin.de5.net; r=to; s=noreply@x.ai"
+                    ],
+                    "To": ["Hide My Email <mics-vital0p@icloud.com>"],
+                },
+                "body": {"text": "Your SpaceXAI confirmation code is 436-015"},
+                "posix-millis": 1788370827640,
+            }
+        )
+
+    mails = inbucket.list_forward_mails(
+        http_get, "http://127.0.0.1:9000", "apple2@konsin.de5.net", limit=40
+    )
+    assert len(mails) == 1
+    assert cf_admin.mail_targets_hme_alias(mails[0], "mics-vital0p@icloud.com")
+    assert not cf_admin.mail_targets_hme_alias(mails[0], "other@icloud.com")
+    assert "436-015" in str(mails[0].get("subject") or "")
+
+
 def test_list_messages_raises_on_http_error():
     def http_get(url, **kwargs):
         return FakeResponse({"error": "nope"}, status_code=500)
@@ -272,5 +304,6 @@ if __name__ == "__main__":
     test_wait_for_code_timeout_purges()
     test_wait_for_code_requires_base()
     test_list_messages_raises_on_http_error()
+    test_list_forward_mails_preserves_hme_header()
     test_connectivity_probe()
     print("OK inbucket")

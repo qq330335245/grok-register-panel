@@ -443,31 +443,76 @@ def is_retriable_upload_error(exc: BaseException | str) -> bool:
     return any(marker in msg for marker in retriable_markers)
 
 
-def upload_build_account(
+def _retry_admin_import(
+    do_import,
+    *,
+    retries: int = 3,
+    retry_delay_s: float = 2.0,
+    log: LogFn | None = None,
+    label: str = "upload",
+) -> dict[str, int]:
+    try:
+        extra = max(0, int(retries))
+    except (TypeError, ValueError):
+        extra = 3
+    try:
+        delay = max(0.0, float(retry_delay_s))
+    except (TypeError, ValueError):
+        delay = 2.0
+    total = 1 + extra
+    last_exc: BaseException | None = None
+    for attempt in range(1, total + 1):
+        try:
+            result = do_import(False)
+            if attempt > 1:
+                _log(log, f"{label} retry OK attempt={attempt}/{total}")
+            return result
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if isinstance(exc, RuntimeError) and ("401" in msg or "unauthorized" in msg):
+                _log(log, f"{label} access token rejected, re-login and retry import")
+                try:
+                    result = do_import(True)
+                    if attempt > 1:
+                        _log(log, f"{label} retry OK attempt={attempt}/{total}")
+                    return result
+                except Exception as relogin_exc:
+                    last_exc = relogin_exc
+                    exc = relogin_exc
+            if attempt >= total or not is_retriable_upload_error(exc):
+                break
+            wait_s = delay * attempt
+            _log(log, f"{label} failed attempt={attempt}/{total}, retry in {wait_s:.1f}s: {exc}")
+            if wait_s > 0:
+                time.sleep(wait_s)
+    assert last_exc is not None
+    raise last_exc
+
+
+def upload_build_accounts(
     base_url: str,
     username: str,
     password: str,
-    entry: dict,
+    entries: list[dict],
     *,
     timeout: float = 180,
     log: LogFn | None = None,
     retries: int = 3,
     retry_delay_s: float = 2.0,
+    filename: str = "build-accounts.json",
 ) -> dict[str, int]:
-    if not isinstance(entry, dict):
-        raise ValueError("entry must be a dict")
-    access = str(entry.get("access_token") or "").strip()
-    refresh = str(entry.get("refresh_token") or "").strip()
-    if not access and not refresh:
-        raise ValueError("entry missing access_token/refresh_token")
-
-    email = str(
-        entry.get("email") or entry.get("name") or entry.get("user_id") or "account"
-    ).strip()
-    safe_name = "".join(
-        ch if ch.isalnum() or ch in "._-@" else "_" for ch in email
-    )[:80] or "account"
-    filename = f"{safe_name}.json"
+    accounts: list[dict] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        access = str(entry.get("access_token") or "").strip()
+        refresh = str(entry.get("refresh_token") or "").strip()
+        if access or refresh:
+            accounts.append(entry)
+    if not accounts:
+        raise ValueError("no Build accounts to import")
+    timeout = max(float(timeout or 180), min(600.0, 12.0 * len(accounts)))
 
     def _do(force_login: bool = False) -> dict[str, int]:
         token = get_access_token(
@@ -481,59 +526,106 @@ def upload_build_account(
         return import_build_accounts(
             base_url,
             token,
-            [entry],
+            accounts,
             timeout=timeout,
             log=log,
-            filename=filename,
+            filename=filename or "build-accounts.json",
         )
 
+    return _retry_admin_import(
+        _do, retries=retries, retry_delay_s=retry_delay_s, log=log, label="Build"
+    )
+
+
+def upload_build_account(
+    base_url: str,
+    username: str,
+    password: str,
+    entry: dict,
+    *,
+    timeout: float = 180,
+    log: LogFn | None = None,
+    retries: int = 3,
+    retry_delay_s: float = 2.0,
+) -> dict[str, int]:
+    if not isinstance(entry, dict):
+        raise ValueError("entry must be a dict")
+    email = str(
+        entry.get("email") or entry.get("name") or entry.get("user_id") or "account"
+    ).strip()
+    safe_name = "".join(
+        ch if ch.isalnum() or ch in "._-@" else "_" for ch in email
+    )[:80] or "account"
+    return upload_build_accounts(
+        base_url,
+        username,
+        password,
+        [entry],
+        timeout=timeout,
+        log=log,
+        retries=retries,
+        retry_delay_s=retry_delay_s,
+        filename=f"{safe_name}.json",
+    )
+
+
+def upload_sso_accounts(
+    base_url: str,
+    username: str,
+    password: str,
+    *,
+    provider: str,
+    items: list[dict],
+    timeout: float = 180,
+    log: LogFn | None = None,
+    retries: int = 3,
+    retry_delay_s: float = 2.0,
+    filename: str = "",
+) -> dict[str, int]:
+    provider = str(provider or "").strip().lower()
+    importers = {
+        "grok_web": import_web_accounts,
+        "grok_console": import_console_accounts,
+    }
     try:
-        extra = max(0, int(retries))
-    except (TypeError, ValueError):
-        extra = 3
-    try:
-        delay = max(0.0, float(retry_delay_s))
-    except (TypeError, ValueError):
-        delay = 2.0
-    total = 1 + extra
-    last_exc: BaseException | None = None
+        importer = importers[provider]
+    except KeyError as exc:
+        raise ValueError("provider must be grok_web or grok_console") from exc
+    entries = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        sso = str(item.get("sso_token") or item.get("sso") or "").strip()
+        if not sso:
+            continue
+        entries.append(sso_account_entry(provider, sso, str(item.get("email") or "")))
+    if not entries:
+        raise ValueError("no SSO accounts to import")
+    label = "web" if provider == "grok_web" else "console"
+    timeout = max(float(timeout or 180), min(600.0, 8.0 * len(entries)))
+    fname = filename or f"{label}-accounts.json"
 
-    for attempt in range(1, total + 1):
-        try:
-            result = _do(False)
-            if attempt > 1:
-                _log(log, f"upload retry OK attempt={attempt}/{total}")
-            return result
-        except Exception as exc:
-            last_exc = exc
-            msg = str(exc).lower()
-            # One-shot re-login on expired admin token, still within this attempt.
-            if isinstance(exc, RuntimeError) and (
-                "401" in msg or "unauthorized" in msg
-            ):
-                _log(log, "access token rejected, re-login and retry import")
-                try:
-                    result = _do(True)
-                    if attempt > 1:
-                        _log(log, f"upload retry OK attempt={attempt}/{total}")
-                    return result
-                except Exception as relogin_exc:
-                    last_exc = relogin_exc
-                    exc = relogin_exc
+    def _do(force_login: bool = False) -> dict[str, int]:
+        token = get_access_token(
+            base_url,
+            username,
+            password,
+            force=force_login,
+            timeout=min(timeout, 60),
+            log=log,
+        )
+        return importer(
+            base_url,
+            token,
+            entries,
+            timeout=timeout,
+            log=log,
+            filename=fname,
+        )
 
-            if attempt >= total or not is_retriable_upload_error(exc):
-                break
-
-            wait_s = delay * attempt
-            _log(
-                log,
-                f"upload failed attempt={attempt}/{total}, retry in {wait_s:.1f}s: {exc}",
-            )
-            if wait_s > 0:
-                time.sleep(wait_s)
-
-    assert last_exc is not None
-    raise last_exc
+    return _retry_admin_import(
+        _do, retries=retries, retry_delay_s=retry_delay_s, log=log, label=label
+    )
 
 
 def upload_sso_account(
@@ -549,69 +641,22 @@ def upload_sso_account(
     retries: int = 3,
     retry_delay_s: float = 2.0,
 ) -> dict[str, int]:
-    """Upload one registration SSO to Grok Web or Console with retries.
-
-    Callers enabling both providers must invoke this once per provider with the
-    same ``sso_token``. The server then creates the trusted Web↔Console link.
-    """
-    provider = str(provider or "").strip().lower()
-    importers = {
-        "grok_web": import_web_accounts,
-        "grok_console": import_console_accounts,
-    }
-    try:
-        importer = importers[provider]
-    except KeyError as exc:
-        raise ValueError("provider must be grok_web or grok_console") from exc
-    entry = sso_account_entry(provider, sso_token, email)
-    label = "web" if provider == "grok_web" else "console"
+    """Upload one registration SSO to Grok Web or Console with retries."""
+    label = "web" if str(provider or "").strip().lower() == "grok_web" else "console"
     safe_email = str(email or "account").strip()
     safe_name = "".join(ch if ch.isalnum() or ch in "._-@" else "_" for ch in safe_email)[:80] or "account"
-
-    def _do(force_login: bool = False) -> dict[str, int]:
-        token = get_access_token(
-            base_url, username, password, force=force_login,
-            timeout=min(timeout, 60), log=log,
-        )
-        return importer(
-            base_url, token, [entry], timeout=timeout, log=log,
-            filename=f"{label}-{safe_name}.json",
-        )
-
-    try:
-        extra = max(0, int(retries))
-    except (TypeError, ValueError):
-        extra = 3
-    try:
-        delay = max(0.0, float(retry_delay_s))
-    except (TypeError, ValueError):
-        delay = 2.0
-    total = 1 + extra
-    last_exc: BaseException | None = None
-    for attempt in range(1, total + 1):
-        try:
-            result = _do()
-            if attempt > 1:
-                _log(log, f"{label} upload retry OK attempt={attempt}/{total}")
-            return result
-        except Exception as exc:
-            last_exc = exc
-            message = str(exc).lower()
-            if isinstance(exc, RuntimeError) and ("401" in message or "unauthorized" in message):
-                _log(log, f"{label} access token rejected, re-login and retry import")
-                try:
-                    return _do(True)
-                except Exception as relogin_exc:
-                    last_exc = relogin_exc
-                    exc = relogin_exc
-            if attempt >= total or not is_retriable_upload_error(exc):
-                break
-            wait_s = delay * attempt
-            _log(log, f"{label} upload failed attempt={attempt}/{total}, retry in {wait_s:.1f}s: {exc}")
-            if wait_s > 0:
-                time.sleep(wait_s)
-    assert last_exc is not None
-    raise last_exc
+    return upload_sso_accounts(
+        base_url,
+        username,
+        password,
+        provider=provider,
+        items=[{"sso_token": sso_token, "email": email}],
+        timeout=timeout,
+        log=log,
+        retries=retries,
+        retry_delay_s=retry_delay_s,
+        filename=f"{label}-{safe_name}.json",
+    )
 
 
 def clear_token_cache() -> None:

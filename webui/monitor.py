@@ -3816,7 +3816,7 @@ async function loadAccounts(page) {
     renderAccounts(data);
     const job = data.job || {};
     document.getElementById("accounts-job").textContent = job.running
-      ? ((job.kind === "detect" ? "检测中" : (job.kind === "upload" ? "上传中" : "任务")) + " " + (job.done || 0) + "/" + (job.total || 0))
+      ? ((job.kind === "detect" ? "检测中" : (job.kind === "upload" ? "上传中" : "任务")) + " " + (job.done || 0) + "/" + (job.total || 0) + (job.workers ? " · 并发" + job.workers : ""))
       : ("共 " + (data.total || 0) + " 个");
     if (job.running) {
       clearTimeout(acctTimer);

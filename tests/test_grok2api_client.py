@@ -87,6 +87,39 @@ def test_pending_files():
         assert web_data["accounts"][0]["sso_token"] == "sso-token"
 
 
+def test_upload_build_accounts_sends_all_entries():
+    captured = {}
+
+    def fake_token(*args, **kwargs):
+        return "admin-token"
+
+    def fake_import(base_url, access_token, accounts, **kwargs):
+        captured["accounts"] = accounts
+        captured["filename"] = kwargs.get("filename")
+        return {"created": len(accounts), "updated": 0, "synced": 0, "syncFailed": 0, "skipped": 0}
+
+    orig_token, orig_import = g2a.get_access_token, g2a.import_build_accounts
+    g2a.get_access_token = fake_token
+    g2a.import_build_accounts = fake_import
+    try:
+        result = g2a.upload_build_accounts(
+            "http://127.0.0.1:18000",
+            "u",
+            "p",
+            [
+                {"access_token": "a1", "email": "a@x.com"},
+                {"refresh_token": "r2", "email": "b@x.com"},
+            ],
+            retries=0,
+        )
+    finally:
+        g2a.get_access_token = orig_token
+        g2a.import_build_accounts = orig_import
+    assert result["created"] == 2
+    assert len(captured["accounts"]) == 2
+    assert captured["filename"] == "build-accounts.json"
+
+
 def test_retriable_errors():
     assert g2a.is_retriable_upload_error("HTTP 502 bad gateway")
     assert g2a.is_retriable_upload_error("timed out")
@@ -99,5 +132,6 @@ if __name__ == "__main__":
     test_token_to_grok2api_account()
     test_sso_account_entry()
     test_pending_files()
+    test_upload_build_accounts_sends_all_entries()
     test_retriable_errors()
     print("ok")

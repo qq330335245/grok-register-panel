@@ -33,6 +33,7 @@ from runtime_platform import (
 )
 
 apply_runtime_tmpdir()
+from task_cooldown import reset_task_cooldown
 
 try:
     from webui.blacklist_store import read_blacklist as read_blacklist_state
@@ -307,6 +308,8 @@ def load_control() -> dict:
         c.setdefault("batch_count", 40)
         c.setdefault("add_count", 40)  # 再跑 N 个
         c.setdefault("account_interval", _read_config_account_interval())
+        c.setdefault("cooldown_every", 0)
+        c.setdefault("cooldown_seconds", 60)
         c.setdefault("mode", "orch")  # orch | batch
         return c
 
@@ -318,6 +321,8 @@ def save_control(updates: dict) -> dict:
         "batch_count",
         "add_count",
         "account_interval",
+        "cooldown_every",
+        "cooldown_seconds",
         "mode",
         "base_cpa",
         "target_cpa",
@@ -343,6 +348,14 @@ def save_control(updates: dict) -> dict:
             c["add_count"] = 40
         c["mode"] = c.get("mode") if c.get("mode") in ("orch", "batch") else "orch"
         c["account_interval"] = _normalize_account_interval(c.get("account_interval"))
+        try:
+            c["cooldown_every"] = max(0, min(2000, int(c.get("cooldown_every", 0) or 0)))
+        except Exception:
+            c["cooldown_every"] = 0
+        try:
+            c["cooldown_seconds"] = max(0, min(86400, int(c.get("cooldown_seconds", 60) or 0)))
+        except Exception:
+            c["cooldown_seconds"] = 60
         try:
             _write_config_account_interval(c["account_interval"])
         except Exception:
@@ -788,6 +801,13 @@ def _registration_env() -> dict[str, str]:
         env.setdefault("PYTHONUTF8", "1")
     apply_runtime_tmpdir(env)
     apply_playwright_node_env(env)
+    try:
+        control = load_control()
+    except Exception:
+        control = {}
+    env["GROK_TASK_COOLDOWN_EVERY"] = str(int(control.get("cooldown_every") or 0))
+    env["GROK_TASK_COOLDOWN_SECONDS"] = str(int(control.get("cooldown_seconds") or 0))
+    env["GROK_TASK_COOLDOWN_FILE"] = str(LOG_DIR / "task_cooldown.json")
     return env
 
 
@@ -833,6 +853,7 @@ def _start_orch_unlocked():
         f"workers={c.get('workers')} cpa={now} target={c.get('target_cpa')} need={need} ---\n"
     )
     stdout.flush()
+    reset_task_cooldown()
     try:
         p = subprocess.Popen(
             [str(VENV_PY), "-u", str(ORCH_SCRIPT)],
@@ -886,6 +907,7 @@ def _start_batch_only_unlocked():
     fd = os.open(logname, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     best_effort_fchmod(fd, 0o600)
     fout = os.fdopen(fd, "w", encoding="utf-8")
+    reset_task_cooldown()
     try:
         p = subprocess.Popen(
             batch_launch_command(
@@ -2260,6 +2282,12 @@ HTML = r"""<!DOCTYPE html>
       </div>
       <div class="field"><label for="account_interval">号间隔（秒）</label>
         <input id="account_interval" type="text" value="0" placeholder="0 或 60-120" title="号与号之间等待：0=不等，30=固定30秒，60-120=随机"/>
+      </div>
+      <div class="field"><label for="cooldown_every">冷却数量</label>
+        <input type="number" id="cooldown_every" min="0" max="2000" value="0" title="本次任务每成功 N 个暂停一次；0=关闭"/>
+      </div>
+      <div class="field"><label for="cooldown_seconds">冷却秒数</label>
+        <input type="number" id="cooldown_seconds" min="0" max="86400" value="60" title="达到冷却数量后等待的秒数"/>
       </div>
       <div class="control-actions">
         <button class="primary" id="btn-start" onclick="doStart()">启动任务</button>
@@ -4168,12 +4196,14 @@ async function refresh() {
 }
 function fillControl(d) {
   const c = d.control || {};
-  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode","account_interval"].includes(document.activeElement.id)) return;
+  if (document.activeElement && ["workers-input","batch_count","add_count","risk_pause","mode","account_interval","cooldown_every","cooldown_seconds"].includes(document.activeElement.id)) return;
   if (c.workers != null) document.getElementById("workers-input").value = c.workers;
   if (c.batch_count != null) document.getElementById("batch_count").value = c.batch_count;
   if (c.add_count != null && document.getElementById("add_count")) document.getElementById("add_count").value = c.add_count;
   if (c.risk_pause != null) document.getElementById("risk_pause").value = c.risk_pause;
   if (c.account_interval != null && document.getElementById("account_interval")) document.getElementById("account_interval").value = c.account_interval;
+  if (c.cooldown_every != null && document.getElementById("cooldown_every")) document.getElementById("cooldown_every").value = c.cooldown_every;
+  if (c.cooldown_seconds != null && document.getElementById("cooldown_seconds")) document.getElementById("cooldown_seconds").value = c.cooldown_seconds;
   if (c.mode) document.getElementById("mode").value = c.mode;
 }
 function controlBody() {
@@ -4183,6 +4213,8 @@ function controlBody() {
     add_count: Number((document.getElementById("add_count") || {}).value || 40),
     risk_pause: Number(document.getElementById("risk_pause").value || 10),
     account_interval: (document.getElementById("account_interval") || {}).value || "0",
+    cooldown_every: Number((document.getElementById("cooldown_every") || {}).value || 0),
+    cooldown_seconds: Number((document.getElementById("cooldown_seconds") || {}).value || 60),
     mode: document.getElementById("mode").value || "orch",
   };
 }

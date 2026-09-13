@@ -21,6 +21,7 @@ from runtime_platform import (
 
 apply_runtime_tmpdir()
 from retry_policy import PRECHECK_EXIT_CODE, RISK_STREAK_EXIT_CODE, orchestrator_failure_limit
+from task_cooldown import apply_task_cooldown_wait, remaining_task_cooldown
 from secure_files import append_private_text, best_effort_fchmod, ensure_private_dir
 from webui.blacklist_store import add_asn as add_blacklist_asn
 from webui.blacklist_store import read_blacklist
@@ -121,6 +122,17 @@ def start_batch(count: int):
             env.setdefault("PYTHONUTF8", "1")
         apply_runtime_tmpdir(env)
         apply_playwright_node_env(env)
+        env["GROK_TASK_COOLDOWN_KEEP"] = "1"
+        env.setdefault(
+            "GROK_TASK_COOLDOWN_FILE",
+            str(LOG_DIR / "task_cooldown.json"),
+        )
+        try:
+            ctrl = load_control()
+            env["GROK_TASK_COOLDOWN_EVERY"] = str(int(ctrl.get("cooldown_every") or 0))
+            env["GROK_TASK_COOLDOWN_SECONDS"] = str(int(ctrl.get("cooldown_seconds") or 0))
+        except Exception:
+            pass
         proc = subprocess.Popen(
             batch_launch_command(
                 ROOT,
@@ -379,6 +391,10 @@ def main():
                 kill_batch()
                 break
         time.sleep(3)
+        ok_n, cool_wait = remaining_task_cooldown()
+        if cool_wait > 0:
+            log(f"task cooldown remaining {cool_wait:.0f}s after {ok_n} successes")
+            apply_task_cooldown_wait(log, lambda: False, lambda wait, _stop: time.sleep(wait))
         if cpa_count() >= TARGET_CPA:
             break
 

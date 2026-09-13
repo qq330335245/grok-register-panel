@@ -66,6 +66,7 @@ from risk_breaker import (
     risk_breaker_reason,
     risk_breaker_should_stop,
 )
+from task_cooldown import apply_task_cooldown_wait, note_task_success, reset_task_cooldown
 from build_bot_risk import inspect_build_bot_risk
 from secure_files import (
     append_private_text,
@@ -445,6 +446,9 @@ def record_register_result(
         if status == "ok":
             _record_managed_proxy_result(proxy, "success")
             note_risk_success()
+            ok_n, cool_wait = note_task_success()
+            if cool_wait > 0 and log_callback:
+                log_callback(f"[冷却] 本任务已成功 {ok_n} 个，接下来暂停 {int(cool_wait)}s")
         elif status == "risk" or kind == FAIL_RISK:
             _record_managed_proxy_result(proxy, "risk", detail)
             action, wait_s, streak = note_risk_failure()
@@ -4216,6 +4220,7 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
         reset_risk_breaker()
+        reset_task_cooldown()
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
@@ -4497,6 +4502,8 @@ class GrokRegisterGUI:
             while i < count:
                 if apply_risk_breaker_wait(wlog, self.should_stop, sleep_with_cancel):
                     break
+                if apply_task_cooldown_wait(wlog, self.should_stop, sleep_with_cancel):
+                    break
                 if self.should_stop():
                     break
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
@@ -4721,6 +4728,13 @@ def cli_log(message):
 def run_registration_cli(count):
     controller = CliStopController()
     reset_risk_breaker()
+    if str(os.environ.get("GROK_TASK_COOLDOWN_KEEP", "") or "").strip() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        reset_task_cooldown()
 
     # 一次 Ctrl+C 可靠置停：SIGINT 处理器直接设停止标志，不依赖异常在
     # curl_cffi C 回调里向上传播（那里 KeyboardInterrupt 会被吞掉，导致
@@ -4903,6 +4917,13 @@ def run_registration_cli(count):
                 worker_stop = False
                 while i < n and not controller.should_stop() and not worker_stop:
                     if apply_risk_breaker_wait(
+                        lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        controller.should_stop,
+                        sleep_with_cancel,
+                    ):
+                        worker_stop = True
+                        break
+                    if apply_task_cooldown_wait(
                         lambda m: cli_log(f"[W{wid+1}] {m}"),
                         controller.should_stop,
                         sleep_with_cancel,
@@ -5304,6 +5325,8 @@ def run_registration_cli(count):
         i = 0
         while i < count:
             if apply_risk_breaker_wait(cli_log, controller.should_stop, sleep_with_cancel):
+                break
+            if apply_task_cooldown_wait(cli_log, controller.should_stop, sleep_with_cancel):
                 break
             if controller.should_stop():
                 break

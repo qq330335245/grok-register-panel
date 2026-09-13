@@ -2323,7 +2323,7 @@ HTML = r"""<!DOCTYPE html>
           </details>
           <details class="faq-item" data-faq-item data-search="风控 policy deny registration risk botFlagSource ip 邮箱 域名">
             <summary>出现 policy=deny 或注册风控</summary>
-            <div class="faq-answer">注册门禁已改为 grok2api 同款 Build 对话探测：换出 Build token 后打 grok-4.5 思考流，两个粘性出口都无 reasoning 则记为号级风控。动态粘性节点不因风控冷却。连续少量风控会暂停再试，连续加重则整批停止。</div>
+            <div class="faq-answer">注册门禁已改为 grok2api 同款 Build 对话探测：换出 Build token 后打 grok-4.5 思考流，两个粘性出口都无 reasoning 则记为号级风控。动态粘性节点不因风控冷却。连续 2 次降智暂停 30 秒，连续 3 次则整次注册任务停止，编排器不再开下一轮。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="bfs jwt claim access_token 标记 flagged 风控 检测 scan">
             <summary>什么是 bfs，和 botFlagSource 有何不同</summary>

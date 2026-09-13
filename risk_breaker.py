@@ -6,6 +6,7 @@ import time
 from typing import Callable, Mapping
 
 from retry_policy import (
+    RISK_STREAK_EXIT_CODE,
     risk_streak_stop,
     risk_streak_wait_base,
     risk_streak_wait_max,
@@ -13,6 +14,12 @@ from retry_policy import (
 )
 
 LogFn = Callable[[str], None]
+
+
+class RiskCircuitStopped(RuntimeError):
+    """Consecutive 降智 hit the stop threshold; abort the whole registration task."""
+
+    exit_code = RISK_STREAK_EXIT_CODE
 
 
 class RiskCircuitBreaker:
@@ -92,6 +99,10 @@ def note_risk_failure() -> tuple[str, float, int]:
 
 def risk_breaker_should_stop() -> bool:
     return BREAKER.should_stop()
+
+
+def risk_breaker_reason() -> str:
+    return str(BREAKER.reason or "")
 
 
 def apply_risk_breaker_wait(

@@ -17,14 +17,14 @@ from typing import Callable, Mapping, Sequence
 import psutil
 
 from runtime_platform import popen_group_kwargs
-from retry_policy import BATCH_MAX_RESTARTS_DEFAULT, PRECHECK_EXIT_CODE
+from retry_policy import BATCH_MAX_RESTARTS_DEFAULT, PRECHECK_EXIT_CODE, RISK_STREAK_EXIT_CODE
 from secure_files import atomic_write_json, exclusive_file_lock
 
 
 PROGRESS_ENV = "GROK_BATCH_PROGRESS_FILE"
 DEFAULT_IDLE_TIMEOUT = 360
 DEFAULT_MAX_RESTARTS = BATCH_MAX_RESTARTS_DEFAULT
-NON_RETRYABLE_EXIT_CODES = frozenset({PRECHECK_EXIT_CODE})
+NON_RETRYABLE_EXIT_CODES = frozenset({PRECHECK_EXIT_CODE, RISK_STREAK_EXIT_CODE})
 
 _PROGRESS_LOCK = threading.Lock()
 _DRIVER_CRASH_MARKERS = (

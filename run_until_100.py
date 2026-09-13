@@ -20,7 +20,7 @@ from runtime_platform import (
 )
 
 apply_runtime_tmpdir()
-from retry_policy import PRECHECK_EXIT_CODE, orchestrator_failure_limit
+from retry_policy import PRECHECK_EXIT_CODE, RISK_STREAK_EXIT_CODE, orchestrator_failure_limit
 from secure_files import append_private_text, best_effort_fchmod, ensure_private_dir
 from webui.blacklist_store import add_asn as add_blacklist_asn
 from webui.blacklist_store import read_blacklist
@@ -355,6 +355,9 @@ def main():
                 log(f"  batch exited rc={return_code}")
                 if return_code == PRECHECK_EXIT_CODE:
                     log("ORCH STOP xAI registration page precheck failed")
+                    return
+                if return_code == RISK_STREAK_EXIT_CODE:
+                    log("ORCH STOP consecutive risk circuit; registration task aborted")
                     return
                 if return_code not in (0, None):
                     consecutive_batch_failures += 1

@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import run_until_100 as orch
-from retry_policy import PRECHECK_EXIT_CODE
+from retry_policy import PRECHECK_EXIT_CODE, RISK_STREAK_EXIT_CODE
 
 
 class FakeProcess:
@@ -87,6 +87,12 @@ def test_precheck_failure_stops_orchestrator_immediately():
     assert any("precheck failed" in message for message in messages)
 
 
+def test_risk_circuit_stops_orchestrator_immediately():
+    launches, messages = _run_with_exit_codes([RISK_STREAK_EXIT_CODE])
+    assert launches == [RISK_STREAK_EXIT_CODE]
+    assert any("consecutive risk circuit" in message for message in messages)
+
+
 def test_consecutive_abnormal_batches_are_bounded():
     launches, messages = _run_with_exit_codes([1, 1, 1])
     assert launches == [1, 1]
@@ -95,5 +101,6 @@ def test_consecutive_abnormal_batches_are_bounded():
 
 if __name__ == "__main__":
     test_precheck_failure_stops_orchestrator_immediately()
+    test_risk_circuit_stops_orchestrator_immediately()
     test_consecutive_abnormal_batches_are_bounded()
     print("OK orchestrator policy")

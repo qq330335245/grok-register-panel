@@ -7,7 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from risk_breaker import RiskCircuitBreaker
+from retry_policy import RISK_STREAK_EXIT_CODE
+from risk_breaker import RiskCircuitBreaker, RiskCircuitStopped
 
 
 def test_streak_waits_then_stops():
@@ -29,6 +30,10 @@ def test_streak_waits_then_stops():
     assert br.should_stop() is True
 
 
+def test_circuit_stopped_exit_code():
+    assert RiskCircuitStopped.exit_code == RISK_STREAK_EXIT_CODE == 79
+
+
 def test_success_resets_streak():
     env = {"GROK_RISK_STREAK_WAIT": "2", "GROK_RISK_STREAK_STOP": "5"}
     br = RiskCircuitBreaker(env)
@@ -41,5 +46,6 @@ def test_success_resets_streak():
 
 if __name__ == "__main__":
     test_streak_waits_then_stops()
+    test_circuit_stopped_exit_code()
     test_success_resets_streak()
     print("OK risk breaker")

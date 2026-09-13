@@ -58,10 +58,12 @@ from batch_supervisor import mark_slot_completed
 from batch_traffic import mark_successful_account
 from retry_policy import proxy_boot_rotations, slot_retries
 from risk_breaker import (
+    RiskCircuitStopped,
     apply_risk_breaker_wait,
     note_risk_failure,
     note_risk_success,
     reset_risk_breaker,
+    risk_breaker_reason,
     risk_breaker_should_stop,
 )
 from build_bot_risk import inspect_build_bot_risk
@@ -4451,6 +4453,10 @@ class GrokRegisterGUI:
         finally:
             # 协调线程自身无浏览器；各 worker 线程 finally 已各自 stop
             self._set_running_ui(False)
+            if risk_breaker_should_stop():
+                self.log(
+                    f"[风控] {risk_breaker_reason() or '连续风控已熔断'}，整次注册任务已停止"
+                )
             self.log(
                 f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
                 + (f" | {format_fail_stats(self.fail_stats)}" if self.fail_count else "")
@@ -5573,6 +5579,9 @@ def run_registration_cli(count):
             signal.signal(signal.SIGINT, _prev_sigint)
         except Exception:
             pass
+    if risk_breaker_should_stop() and not controller.stop_requested:
+        cli_log("[风控] 连续风控熔断，整次注册任务已停止")
+        raise RiskCircuitStopped(risk_breaker_reason() or "连续风控已熔断，停止注册")
 
 
 def main_cli():

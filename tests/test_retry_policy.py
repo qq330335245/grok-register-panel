@@ -23,6 +23,7 @@ def test_defaults_are_bounded_and_overridable():
     assert retry_policy.risk_streak_wait_start({}) == 2
     assert retry_policy.risk_streak_stop({}) == 5
     assert retry_policy.risk_streak_wait_base({}) == 30
+    assert retry_policy.RISK_STREAK_EXIT_CODE == 79
 
 
 def test_xai_failure_is_explicitly_non_retryable():

@@ -23,7 +23,7 @@ from batch_supervisor import (
     read_completed,
     run_supervisor,
 )
-from retry_policy import PRECHECK_EXIT_CODE
+from retry_policy import PRECHECK_EXIT_CODE, RISK_STREAK_EXIT_CODE
 
 
 def test_driver_crash_detection_is_specific():
@@ -144,6 +144,34 @@ raise SystemExit(78)
         assert launches.read_text() == "1"
 
 
+def test_supervisor_does_not_restart_risk_circuit():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        progress = root / "progress.json"
+        launches = root / "launches.txt"
+        child = root / "risk_fail.py"
+        child.write_text(
+            """
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+count = int(path.read_text()) if path.exists() else 0
+path.write_text(str(count + 1))
+raise SystemExit(79)
+""".lstrip(),
+            encoding="utf-8",
+        )
+        result = run_supervisor(
+            4,
+            2,
+            lambda _remaining, _workers: [sys.executable, str(child), str(launches)],
+            progress_file=progress,
+            max_restarts=2,
+        )
+        assert result == RISK_STREAK_EXIT_CODE
+        assert launches.read_text() == "1"
+
+
 def test_clean_exit_drains_pipe_before_restart_decision():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -176,5 +204,6 @@ if __name__ == "__main__":
     test_progress_updates_are_thread_safe_and_private()
     test_supervisor_restarts_after_driver_crash()
     test_supervisor_does_not_restart_precheck_failure()
+    test_supervisor_does_not_restart_risk_circuit()
     test_clean_exit_drains_pipe_before_restart_decision()
     print("OK batch supervisor")

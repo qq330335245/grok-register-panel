@@ -27,7 +27,7 @@ from batch_traffic import (
     finalize_batch,
     initialize_batch,
 )
-from retry_policy import PRECHECK_EXIT_CODE
+from retry_policy import PRECHECK_EXIT_CODE, RISK_STREAK_EXIT_CODE
 from secure_files import atomic_write_json, ensure_private_dir
 
 
@@ -142,6 +142,9 @@ def _run_child(count: int, workers: int) -> int:
     except connectivity.XaiSignupPrecheckFailed:
         print("[batch] xAI registration page precheck failed; batch stopped", flush=True)
         return PRECHECK_EXIT_CODE
+    except app.RiskCircuitStopped as exc:
+        print(f"[batch] consecutive risk circuit stopped; task aborted: {exc}", flush=True)
+        return RISK_STREAK_EXIT_CODE
     print("[batch] finished", flush=True)
     return 0
 

@@ -40,6 +40,10 @@ def test_xai_failure_is_explicitly_non_retryable():
     source = (ROOT / "run_batch_headless.py").read_text(encoding="utf-8")
     assert "has_blocking_xai_failure = lambda" not in source
     assert "PRECHECK_EXIT_CODE" in source
+    ttk = (ROOT / "grok_register_ttk.py").read_text(encoding="utf-8")
+    idx = ttk.find("if workers > 1:")
+    nxt = ttk.find("single_rotate_idx", idx)
+    assert "raise RiskCircuitStopped" in ttk[idx:nxt]
 
 
 def test_xai_precheck_failure_updates_managed_proxy_health():

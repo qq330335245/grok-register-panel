@@ -5284,6 +5284,9 @@ def run_registration_cli(count):
             signal.signal(signal.SIGINT, _prev_sigint)
         except Exception:
             pass
+        if risk_breaker_should_stop() and not controller.stop_requested:
+            cli_log("[风控] 连续风控熔断，整次注册任务已停止")
+            raise RiskCircuitStopped(risk_breaker_reason() or "连续风控已熔断，停止注册")
         return
 
     try:

@@ -245,8 +245,11 @@ def list_forward_mails(
         cap = max(1, int(limit or 40))
     except Exception:
         cap = 40
+    # Inbucket mailbox lists oldest-first; xAI codes land at the tail while Mage/ChatGPT fill the head.
+    window = messages[-cap:]
+    window = list(reversed(window))
     out: List[dict] = []
-    for msg in messages[:cap]:
+    for msg in window:
         if not isinstance(msg, dict):
             continue
         mid = str(msg.get("id") or "").strip()

@@ -21,7 +21,7 @@ HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
 
 MAIL_LIST_LIMIT = 5
-FORWARD_MAIL_LIST_LIMIT = 40
+FORWARD_MAIL_LIST_LIMIT = 80
 DEFAULT_POLL_INTERVAL = 8.0
 MAX_POLL_INTERVAL = 12.0
 ADMIN_MAIL_LIMITS: Tuple[int, ...] = (5, 1)

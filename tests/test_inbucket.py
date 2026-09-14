@@ -245,6 +245,24 @@ def test_list_forward_mails_preserves_hme_header():
     assert "436-015" in str(mails[0].get("subject") or "")
 
 
+def test_list_forward_mails_reads_newest_not_oldest():
+    listed = [{"id": f"old-{i}"} for i in range(5)] + [{"id": "new-xai"}]
+
+    def http_get(url, **kwargs):
+        if url.endswith("/mailbox/apple2%40konsin.de5.net"):
+            return FakeResponse(listed)
+        mid = url.rstrip("/").rsplit("/", 1)[-1]
+        return FakeResponse({"id": mid, "subject": mid, "header": {}, "body": {"text": ""}})
+
+    mails = inbucket.list_forward_mails(
+        http_get, "http://127.0.0.1:9000", "apple2@konsin.de5.net", limit=2
+    )
+    ids = [m.get("id") for m in mails]
+    assert ids[0] == "new-xai"
+    assert "old-0" not in ids
+    assert len(ids) == 2
+
+
 def test_list_messages_raises_on_http_error():
     def http_get(url, **kwargs):
         return FakeResponse({"error": "nope"}, status_code=500)
@@ -305,5 +323,6 @@ if __name__ == "__main__":
     test_wait_for_code_requires_base()
     test_list_messages_raises_on_http_error()
     test_list_forward_mails_preserves_hme_header()
+    test_list_forward_mails_reads_newest_not_oldest()
     test_connectivity_probe()
     print("OK inbucket")

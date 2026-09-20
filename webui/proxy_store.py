@@ -778,18 +778,29 @@ def delete_proxy(proxy_id: str) -> dict:
 
 
 def worker_proxy_snapshot() -> dict:
-    """Return secret worker URLs plus whether a managed pool is configured."""
+    """Return secret worker URLs plus whether a managed pool is in use.
+
+    configured: at least one item is enabled (unhealthy still counts).
+    all_disabled: pool has rows but every item is disabled → 直连, do not
+    treat as managed-empty.
+    """
     with exclusive_file_lock(LOCK_PATH):
         state, _ = _read_unlocked()
         changed = _release_expired_cooldowns(state)
+        items = list(state["items"] or [])
+        enabled = [item for item in items if item.get("enabled")]
         urls = [
             item["url"]
-            for item in state["items"]
+            for item in items
             if _item_usable_for_workers(item)
         ]
         if changed:
             _write_unlocked(state)
-    return {"configured": bool(state["items"]), "urls": urls}
+    return {
+        "configured": bool(enabled),
+        "all_disabled": bool(items) and not enabled,
+        "urls": urls,
+    }
 
 
 def list_worker_proxies() -> list[str]:

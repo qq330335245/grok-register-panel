@@ -720,8 +720,11 @@ def probe_ready_proxy_url(url: str = "") -> str:
 def startup_check_proxy() -> str:
     """Proxy used for batch precheck. Never fall back to a dead config.proxy
     when the panel pool is configured but currently empty/unhealthy.
+    All-disabled pool is 直连 (empty URL), not managed-empty.
     """
     pool = load_proxy_pool()
+    if _proxy_pool_source == "direct":
+        return ""
     if _proxy_pool_source == "managed-empty":
         raise RuntimeError(
             "面板代理池没有健康且启用的代理，请先在代理池点「检测全部」后再启动"
@@ -739,6 +742,11 @@ def load_proxy_pool(path: str = "") -> list:
     except Exception:
         managed_snapshot = {"configured": False, "urls": []}
     managed = list(managed_snapshot.get("urls") or [])
+    if managed_snapshot.get("all_disabled"):
+        with _proxy_pool_lock:
+            _proxy_pool = []
+            _proxy_pool_source = "direct"
+            return []
     if managed_snapshot.get("configured"):
         with _proxy_pool_lock:
             _proxy_pool = managed
@@ -875,6 +883,15 @@ def pick_proxy_for_worker(worker_id: int, rotate_idx: int = 0) -> str:
     if not pool:
         if _proxy_pool_source == "managed-empty":
             raise RuntimeError("面板代理池没有健康且启用的代理，请先检测或等待冷却结束")
+        if _proxy_pool_source == "direct":
+            return ""
+        snap = {}
+        try:
+            snap = _managed_worker_proxy_snapshot() or {}
+        except Exception:
+            snap = {}
+        if snap.get("all_disabled"):
+            return ""
         return str(config.get("proxy", "") or "").strip()
     wid = max(0, int(worker_id))
     rot = max(0, int(rotate_idx))

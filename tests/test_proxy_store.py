@@ -143,6 +143,7 @@ def test_probe_result_and_runtime_cooldown_control_worker_selection():
         proxy_id = imported["imported_ids"][0]
         assert proxy_store.list_worker_proxies() == []
         assert proxy_store.worker_proxy_snapshot()["configured"] is True
+        assert proxy_store.worker_proxy_snapshot()["all_disabled"] is False
 
         proxy_store._apply_probe_result(
             proxy_id,
@@ -427,6 +428,30 @@ def test_sticky_template_risk_does_not_cooldown():
         assert template in proxy_store.list_worker_proxies()
 
 
+def test_all_disabled_pool_is_direct_not_managed_empty():
+    with IsolatedStore():
+        imported = proxy_store.import_proxies("proxy.example:8080:user:pass")
+        proxy_id = imported["imported_ids"][0]
+        proxy_store._apply_probe_result(
+            proxy_id,
+            {
+                "ok": True,
+                "exit_ip": "203.0.113.9",
+                "asn": 64500,
+                "asn_org": "Example ISP",
+                "latency_ms": 10,
+                "checked_at": "2026-07-30T00:00:00Z",
+            },
+        )
+        assert proxy_store.worker_proxy_snapshot()["configured"] is True
+        assert proxy_store.update_proxy(proxy_id, enabled=False)["ok"] is True
+        snap = proxy_store.worker_proxy_snapshot()
+        assert snap["configured"] is False
+        assert snap["all_disabled"] is True
+        assert snap["urls"] == []
+        assert proxy_store.list_worker_proxies() == []
+
+
 if __name__ == "__main__":
     test_sticky_template_normalize_expand_and_probe_identity()
     test_normalize_proxy_formats_and_rejects_paths()
@@ -440,4 +465,5 @@ if __name__ == "__main__":
     test_parse_probe_payload_accepts_ipv6_json_and_plain_ip()
     test_probe_proxy_falls_back_to_ipv6_after_v4_socks_failure()
     test_sticky_template_risk_does_not_cooldown()
+    test_all_disabled_pool_is_direct_not_managed_empty()
     print("OK proxy store")

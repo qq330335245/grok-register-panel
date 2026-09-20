@@ -870,7 +870,8 @@ def create_browser_options(unique_profile=True) -> dict:
     opts: dict = {
         "headless": use_headless,  # default headed; set GROK_HEADLESS=1 on broken GPU sessions
         "humanize": humanize_s,  # 鼠标贝塞尔；浮点为 maxTime 秒
-        "geoip": True,          # 基于 IP 匹配时区 / 语言 / 经纬度
+        "geoip": True,          # 基于 IP 匹配时区 / 经纬度
+        "locale": "en-US",      # UI 仍用英文，避免家宽出口（如基辅）把注册按钮译丢
         "block_webrtc": False,  # 伪造 WebRTC IP=出口；整段 block 更像隐私浏览器
         "os": browser_os,       # Windows 配置文件：UA + hints + 字体 + WebGL
         "window": (width, height),

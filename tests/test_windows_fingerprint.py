@@ -62,7 +62,7 @@ def test_create_browser_options_pins_windows(monkeypatch=None):
         opts = create_browser_options(unique_profile=False)
         assert opts["os"] == "windows"
         assert opts["block_webrtc"] is False
-        assert "locale" not in opts
+        assert opts.get("locale") == "en-US"
         assert isinstance(opts["humanize"], float)
         assert 0.7 <= float(opts["humanize"]) <= 1.8
         assert opts.get("window") in {

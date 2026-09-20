@@ -15,7 +15,7 @@
 
 ### Changed
 
-- Camoufox no longer blocks WebRTC or pins `locale=en-US`; geoip spoofs the exit IP onto WebRTC and fills locale/timezone. Each session picks a common Windows window size, a 0.7–1.8s humanize cap, and a desktop WebGL pair (no WARP/SwiftShader). Linux Xvfb defaults to 3840×2160 so those windows fit.
+- Camoufox no longer blocks WebRTC; geoip spoofs the exit IP onto WebRTC and still fills timezone. UI locale stays `en-US` so signup buttons are not translated off the matcher when the sticky exit is not US. Each session picks a common Windows window size, a 0.7–1.8s humanize cap, and a desktop WebGL pair (no WARP/SwiftShader). Linux Xvfb defaults to 3840×2160 so those windows fit.
 
 ### Fixed
 

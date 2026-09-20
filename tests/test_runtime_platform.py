@@ -132,7 +132,7 @@ def test_linux_headless_launch_uses_xvfb_automatically():
             "/usr/bin/xvfb-run",
             "-a",
             "-s",
-            "-screen 0 1920x1080x24",
+            "-screen 0 3840x2160x24",
         ]
         assert Path(command[4]).resolve() == python.resolve()
         assert command[-2:] == ["5", "2"]

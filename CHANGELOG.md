@@ -13,8 +13,13 @@
 - Add an `inbucket` email provider for self-hosted Inbucket instances: generate addresses under a configured receive domain and poll the v1 mailbox API for the xAI verification code. Root domains accept a comma-separated rotation list, and `inbucket_random_levels` can stack 1-3 random subdomain labels per address (wildcard MX required).
 - Treat Windows as a first-class runtime: PowerShell setup/batch/panel scripts, Playwright `node.exe` + EPIPE guard (no bash wrapper), default headless batches, and SOCKS5 `PySocks` as a direct dependency so the panel can import remote residential URLs without Linux mixed ports.
 
+### Changed
+
+- Camoufox no longer blocks WebRTC or pins `locale=en-US`; geoip spoofs the exit IP onto WebRTC and fills locale/timezone. Each session picks a common Windows window size, a 0.7–1.8s humanize cap, and a desktop WebGL pair (no WARP/SwiftShader). Linux Xvfb defaults to 3840×2160 so those windows fit.
+
 ### Fixed
 
+- Treat a fully disabled proxy pool as direct connect instead of managed-empty, so batches are not blocked after every node is turned off.
 - Relay authenticated SOCKS5 through a local no-auth listener before Camoufox/Firefox. Playwright Firefox rejects SOCKS5 username/password (`Browser does not support socks5 proxy authentication`); the previous `socks5h://user:pass@…` launch path did not actually authenticate and reset `accounts.x.ai`.
 - Add a live-panel **入库配置** view to edit CPA/grok2api delivery targets, admin credentials, and upload switches without hand-editing `config.json`.
 - Port grokRegister-cpa remote grok2api admin import: after SSO→Build OAuth, optionally POST `/api/admin/v1/accounts/import` (and Web/Console SSO imports) with retries and a pending JSON fallback.

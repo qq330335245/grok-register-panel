@@ -157,7 +157,10 @@ def batch_launch_command(
     xvfb = which("xvfb-run")
     if not xvfb:
         raise RuntimePlatformError("找不到 xvfb-run")
-    return [xvfb, "-a", "-s", "-screen 0 1920x1080x24", *command]
+    from fingerprint_profile import xvfb_screen_arg
+
+    env = os.environ if environ is None else environ
+    return [xvfb, "-a", "-s", xvfb_screen_arg(environ=dict(env)), *command]
 
 
 def popen_group_kwargs(*, platform_name: str | None = None) -> dict:

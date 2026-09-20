@@ -61,8 +61,25 @@ def test_create_browser_options_pins_windows(monkeypatch=None):
     try:
         opts = create_browser_options(unique_profile=False)
         assert opts["os"] == "windows"
-        assert opts["block_webrtc"] is True
-        assert opts["humanize"] is True
+        assert opts["block_webrtc"] is False
+        assert "locale" not in opts
+        assert isinstance(opts["humanize"], float)
+        assert 0.7 <= float(opts["humanize"]) <= 1.8
+        assert opts.get("window") in {
+            (1366, 768),
+            (1440, 900),
+            (1536, 864),
+            (1600, 900),
+            (1920, 1080),
+            (1920, 1200),
+            (2560, 1440),
+        }
+        webgl = opts.get("webgl_config")
+        if webgl:
+            assert not any(
+                marker in str(webgl[1]).lower()
+                for marker in ("swiftshader", "basic render", "subzero")
+            )
     finally:
         bs._proxies = orig_proxies
         bs._detect_camoufox_exe = orig_exe

@@ -12,6 +12,7 @@ tests=(
   tests/test_cloudflare_provider.py
   tests/test_runtime_security.py
   tests/test_runtime_platform.py
+  tests/test_fingerprint_profile.py
   tests/test_windows_runtime.py
   tests/test_sso_recovery.py
   tests/test_sso_state.py
@@ -47,6 +48,7 @@ done
   webui \
   email_providers \
   browser_session.py \
+  fingerprint_profile.py \
   connectivity.py \
   grok_register_ttk.py \
   register_flow.py \

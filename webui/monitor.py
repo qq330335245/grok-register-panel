@@ -2351,7 +2351,7 @@ HTML = r"""<!DOCTYPE html>
           </details>
           <details class="faq-item" data-faq-item data-search="风控 policy deny registration risk botFlagSource ip 邮箱 域名">
             <summary>出现 policy=deny 或注册风控</summary>
-            <div class="faq-answer">注册门禁已改为 grok2api 同款 Build 对话探测：换出 Build token 后打 grok-4.5 思考流，两个粘性出口都无 reasoning 则记为号级风控。动态粘性节点不因风控冷却。连续 2 次降智暂停 30 秒，连续 3 次则整次注册任务停止，编排器不再开下一轮。</div>
+            <div class="faq-answer">注册门禁与账号页风控检测都走 grok2api 同款 Build 思考流：必须经粘性 {account}+n 出口（禁止空代理直出面板公网 IP），两个口都无 reasoning 才记号级降智。结果会显示每次真实出口 IP。动态粘性节点不因风控冷却。连续 2 次降智暂停 30 秒，连续 3 次则整次注册任务停止。</div>
           </details>
           <details class="faq-item" data-faq-item data-search="bfs jwt claim access_token 标记 flagged 风控 检测 scan">
             <summary>什么是 bfs，和 botFlagSource 有何不同</summary>
@@ -3822,8 +3822,14 @@ function showAccountJobResult(job) {
     } else {
       badge = it.ok ? `<span class="acct-badge ok">成功</span>` : `<span class="acct-badge fail">失败</span>`;
     }
+    const hops = (it.attempts || []).map(att => {
+      const ident = att.identity || "";
+      const plus = ident.includes("+") ? ident.slice(ident.lastIndexOf("+")) : ident;
+      return [plus, att.exit_ip || "无出口IP", att.status ? ("HTTP " + att.status) : "", att.verdict || att.detail || ""].filter(Boolean).join(" · ");
+    }).filter(Boolean);
+    const hopHtml = hops.length ? hops.map(line => `<div class="acct-result-detail mono">${esc(line)}</div>`).join("") : "";
     return `<div class="acct-result-row">
-      <div><div class="acct-result-email">${esc(it.email)}</div><div class="acct-result-detail">${esc(it.detail || "")}</div></div>
+      <div><div class="acct-result-email">${esc(it.email)}</div><div class="acct-result-detail">${esc(it.detail || "")}</div>${hopHtml}</div>
       <div>${badge}</div>
     </div>`;
   }).join("");

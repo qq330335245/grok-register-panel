@@ -10,6 +10,7 @@ Same rules as grok2api inspectBuildBotRisk:
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
 import uuid
@@ -40,6 +41,12 @@ BOT_RISK_PROBE_PROMPT = (
     "Think step by step before answering. What is 17 multiplied by 19? Give the integer result."
 )
 BOT_RISK_ATTEMPT_TIMEOUT = 75
+BOT_RISK_EXIT_IP_TIMEOUT = 8
+BOT_RISK_EXIT_IP_ENDPOINTS = (
+    "https://[2606:4700:4700::1111]/cdn-cgi/trace",
+    "https://cloudflare.com/cdn-cgi/trace",
+    "https://api64.ipify.org",
+)
 
 VERDICT_INCONCLUSIVE = "inconclusive"
 VERDICT_THINKING = "thinking"
@@ -293,24 +300,90 @@ def scan_thinking_sse(lines: Iterable[object]) -> dict:
     return result
 
 
-def sticky_probe_identity(email: str, attempt: int) -> str:
+def sticky_probe_identity(email: str, attempt: int, *, numbered: bool = False) -> str:
     base = sticky_account_key(email) or "grok_build"
     n = max(1, int(attempt or 1))
-    # First hop uses the same sticky session as signup (already CF-warmed).
-    # Later hops add +n like grok2api to confirm account-level, not IP-level.
-    if n <= 1:
+    # numbered=True matches grok2api {account}+1 / {account}+2.
+    # numbered=False keeps the first hop on the signup sticky session.
+    if n <= 1 and not numbered:
         return base
     return f"{base}+{n}"
 
 
-def expand_probe_proxy(template: str, email: str, attempt: int) -> str:
+def expand_probe_proxy(template: str, email: str, attempt: int, *, numbered: bool = False) -> str:
     raw = str(template or "").strip()
     if not raw:
         return ""
     if not is_sticky_template(raw):
         return raw
-    ident = sticky_probe_identity(email, attempt)
+    ident = sticky_probe_identity(email, attempt, numbered=numbered)
     return expand_proxy_url(raw, email=ident, account=ident, account_id=ident)
+
+
+def parse_exit_ip(body: object) -> str:
+    text = str(body or "").strip()
+    if not text:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().startswith("ip="):
+            cand = line.split("=", 1)[1].strip()
+            if _valid_ip(cand):
+                return cand
+    first = text.split()[0].strip()
+    if _valid_ip(first):
+        return first
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        cand = str(payload.get("ip") or payload.get("query") or "").strip()
+        if _valid_ip(cand):
+            return cand
+    return ""
+
+
+def _valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return False
+    return True
+
+
+def observe_exit_ip(proxy: str, *, http_get: Callable[..., Any] | None = None) -> str:
+    """Resolve the live public IP through the already-expanded sticky proxy."""
+    proxy = str(proxy or "").strip()
+    if not proxy:
+        return ""
+    getter = http_get
+    if getter is None:
+        from curl_cffi import requests as _cffi_requests
+
+        def getter(url, **kwargs):
+            kwargs.setdefault("proxy", proxy)
+            kwargs.setdefault("timeout", BOT_RISK_EXIT_IP_TIMEOUT)
+            kwargs.setdefault("verify", False)
+            return _cffi_requests.get(url, **kwargs)
+
+    last = ""
+    for endpoint in BOT_RISK_EXIT_IP_ENDPOINTS:
+        try:
+            resp = getter(endpoint, proxy=proxy, timeout=BOT_RISK_EXIT_IP_TIMEOUT)
+        except Exception as exc:
+            last = str(exc)
+            continue
+        status = int(getattr(resp, "status_code", 0) or 0)
+        body = str(getattr(resp, "text", "") or "")
+        if status < 200 or status >= 300:
+            last = f"HTTP {status}"
+            continue
+        ip = parse_exit_ip(body)
+        if ip:
+            return ip
+        last = "empty"
+    return ""
 
 
 def _iter_sse_lines(resp) -> Iterable[object]:
@@ -407,7 +480,9 @@ def inspect_build_bot_risk(
     email: str = "",
     proxy_template: str = "",
     attempts: int = BOT_RISK_PROBE_ATTEMPTS,
+    numbered: bool = False,
     http_post: HttpPost | None = None,
+    http_get: Callable[..., Any] | None = None,
     log: LogFn | None = None,
 ) -> dict:
     """Return {ok, flagged, source, reason, attempts} matching grok2api outcomes."""
@@ -427,8 +502,12 @@ def inspect_build_bot_risk(
     total = max(1, int(attempts or BOT_RISK_PROBE_ATTEMPTS))
     live = http_post is None
     for n in range(1, total + 1):
-        proxy = expand_probe_proxy(template, email, n)
-        ident = sticky_probe_identity(email, n) if is_sticky_template(template) else f"direct+{n}"
+        proxy = expand_probe_proxy(template, email, n, numbered=numbered)
+        ident = (
+            sticky_probe_identity(email, n, numbered=numbered)
+            if is_sticky_template(template)
+            else f"direct+{n}"
+        )
         scan = {}
         for retry in range(BOT_RISK_HTTP_RETRIES + 1):
             scan = probe_thinking_once(token, proxy=proxy, http_post=http_post)
@@ -442,9 +521,16 @@ def inspect_build_bot_risk(
                 )
             if live:
                 time.sleep(1.5 * (retry + 1))
+        exit_ip = ""
+        if proxy and (http_get is not None or http_post is None):
+            try:
+                exit_ip = observe_exit_ip(proxy, http_get=http_get)
+            except Exception:
+                exit_ip = ""
         attempt = {
             "identity": ident,
             "proxy_sticky": is_sticky_template(template),
+            "exit_ip": exit_ip,
             "verdict": scan.get("verdict") or VERDICT_INCONCLUSIVE,
             "status": int(scan.get("status") or 0),
             "event": scan.get("event") or "",
@@ -453,8 +539,9 @@ def inspect_build_bot_risk(
         result["attempts"].append(attempt)
         if log:
             log(
-                f"[风控] Build 对话探测 {ident} verdict={attempt['verdict']} "
-                f"http={attempt['status'] or '-'} {attempt['event'] or attempt['detail']}"
+                f"[风控] Build 对话探测 {ident} exit={attempt.get('exit_ip') or '-'} "
+                f"verdict={attempt['verdict']} http={attempt['status'] or '-'} "
+                f"{attempt['event'] or attempt['detail']}"
             )
         verdict = attempt["verdict"]
         if verdict == VERDICT_THINKING:

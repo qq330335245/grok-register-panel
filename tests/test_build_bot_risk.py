@@ -13,6 +13,8 @@ from build_bot_risk import (
     VERDICT_THINKING,
     expand_probe_proxy,
     inspect_build_bot_risk,
+    observe_exit_ip,
+    parse_exit_ip,
     scan_thinking_sse,
     sticky_probe_identity,
 )
@@ -179,6 +181,61 @@ def test_sse_error_message_is_not_empty_stream():
     assert "quota_exceeded" in scan["detail"]
 
 
+
+def test_numbered_identity_matches_grok2api():
+    assert sticky_probe_identity("a@b.com", 1).endswith("a_b_com")
+    assert sticky_probe_identity("a@b.com", 1, numbered=True).endswith("+1")
+    assert sticky_probe_identity("a@b.com", 2, numbered=True).endswith("+2")
+    expanded = expand_probe_proxy("socks5h://g2a.{account}:t@host:1", "a@b.com", 1, numbered=True)
+    assert "+1" in expanded
+
+
+def test_parse_exit_ip_from_trace_and_json():
+    assert parse_exit_ip("fl=1\nip=2a01:d0:a7a0::1\nts=1") == "2a01:d0:a7a0::1"
+    assert parse_exit_ip('{"ip":"203.0.113.9"}') == "203.0.113.9"
+    assert parse_exit_ip("not-an-ip") == ""
+
+
+def test_observe_exit_ip_uses_proxy():
+    seen = []
+
+    class Resp:
+        status_code = 200
+        text = "ip=2001:db8::8\n"
+
+    def http_get(url, **kwargs):
+        seen.append((url, kwargs.get("proxy")))
+        return Resp()
+
+    ip = observe_exit_ip("socks5h://g2a.a:t@host:1", http_get=http_get)
+    assert ip == "2001:db8::8"
+    assert seen and seen[0][1].startswith("socks5h://")
+
+
+def test_inspect_records_exit_ip_from_http_get():
+    class Resp:
+        status_code = 200
+        text = "ip=2001:db8::aa\n"
+
+    def http_get(url, **kwargs):
+        return Resp()
+
+    def http_post(url, **kwargs):
+        return _FakeResp(200, [_data({"type": "response.reasoning_text.delta", "delta": "think"})])
+
+    info = inspect_build_bot_risk(
+        "access-token",
+        email="a@b.com",
+        proxy_template="socks5h://g2a.{account}:t@host:1",
+        numbered=True,
+        http_post=http_post,
+        http_get=http_get,
+    )
+    assert info["ok"] is True
+    assert info["attempts"][0]["exit_ip"] == "2001:db8::aa"
+    assert info["attempts"][0]["identity"].endswith("+1")
+
+
 if __name__ == "__main__":
     test_sse_thinking_beats_later_content()
     test_sse_content_first_is_missing_thinking()
@@ -190,4 +247,8 @@ if __name__ == "__main__":
     test_inspect_http_json_error_includes_message()
     test_inspect_http_code_only_notes_missing_message()
     test_sse_error_message_is_not_empty_stream()
+    test_numbered_identity_matches_grok2api()
+    test_parse_exit_ip_from_trace_and_json()
+    test_observe_exit_ip_uses_proxy()
+    test_inspect_records_exit_ip_from_http_get()
     print("OK build bot risk")

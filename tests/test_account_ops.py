@@ -61,7 +61,49 @@ def test_account_workers_cap():
             os.environ["GROK_ACCOUNT_WORKERS"] = prev
 
 
+def test_resolve_detect_proxy_template_prefers_sticky(monkey_details=None):
+    from webui import account_ops, proxy_store
+    prev_fn = proxy_store.worker_proxy_details
+    proxy_store.worker_proxy_details = lambda: [
+        {"url": "socks5h://g2a.{account}:secret@127.0.0.1:10800", "sticky": True}
+    ]
+    try:
+        url = account_ops.resolve_detect_proxy_template()
+        assert "{account}" in url
+        assert "10800" in url
+    finally:
+        proxy_store.worker_proxy_details = prev_fn
+
+
+def test_resolve_detect_proxy_template_rejects_direct():
+    from webui import account_ops, proxy_store
+    prev_fn = proxy_store.worker_proxy_details
+    proxy_store.worker_proxy_details = lambda: []
+    try:
+        try:
+            account_ops.resolve_detect_proxy_template()
+        except RuntimeError as exc:
+            assert "粘性" in str(exc)
+        else:
+            raise AssertionError("direct detect must fail")
+    finally:
+        proxy_store.worker_proxy_details = prev_fn
+
+
+def test_format_detect_reason_appends_exit_ips():
+    from webui.account_ops import _format_detect_reason
+    text = _format_detect_reason({
+        "reason": "thinking (response.reasoning_text.delta)",
+        "attempts": [{"exit_ip": "2001:db8::1"}, {"exit_ip": "2001:db8::1"}],
+    })
+    assert "出口 2001:db8::1" in text
+    assert text.count("2001:db8::1") == 1
+
+
 if __name__ == "__main__":
     test_detect_batch_is_concurrent()
     test_account_workers_cap()
+    test_resolve_detect_proxy_template_prefers_sticky()
+    test_resolve_detect_proxy_template_rejects_direct()
+    test_format_detect_reason_appends_exit_ips()
     print("OK account ops")

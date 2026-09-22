@@ -125,19 +125,61 @@ def fresh_build_token(email: str, sso: str, log: LogFn | None = None) -> dict:
     return token
 
 
+def resolve_detect_proxy_template() -> str:
+    """风控检测必须走粘性 {account} 出口，禁止空代理直出甲骨文公网 IP。"""
+    from webui.proxy_store import is_sticky_template, worker_proxy_details
+
+    candidates = []
+    try:
+        import grok_register_ttk as register
+        candidates.append(str(register.get_thread_proxy_template() or "").strip())
+        candidates.append(str(register.config.get("proxy") or "").strip())
+    except Exception:
+        pass
+    try:
+        for row in worker_proxy_details() or []:
+            url = str((row or {}).get("url") or "").strip()
+            if url:
+                candidates.append(url)
+    except Exception:
+        pass
+    sticky = next((url for url in candidates if url and is_sticky_template(url)), "")
+    if sticky:
+        return sticky
+    raise RuntimeError("风控检测需要粘性 {account} 代理，当前没有可用粘性出口（拒绝直连）")
+
+
+def _format_detect_reason(info: dict) -> str:
+    reason = str(info.get("reason") or "").strip()
+    ips = []
+    seen = set()
+    for att in info.get("attempts") or []:
+        ip = str((att or {}).get("exit_ip") or "").strip()
+        if ip and ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+    if ips:
+        extra = " / ".join(ips)
+        if extra not in reason:
+            reason = f"{reason} · 出口 {extra}" if reason else f"出口 {extra}"
+    return reason
+
+
 def detect_account(email: str, log: LogFn | None = None) -> dict:
     rec = get_account(email, secrets=True)
     if not rec:
         raise RuntimeError("账号不存在")
     token = fresh_build_token(email, rec.get("sso") or "", log=log)
     from build_bot_risk import inspect_build_bot_risk
-    import grok_register_ttk as register
 
+    template = resolve_detect_proxy_template()
+    if log:
+        log(f"{email} 风控检测走粘性出口模板")
     info = inspect_build_bot_risk(
         str(token.get("access_token") or ""),
         email=email,
-        proxy_template=register.get_thread_proxy_template()
-        or str(register.config.get("proxy") or ""),
+        proxy_template=template,
+        numbered=True,
         log=log,
     )
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -147,17 +189,17 @@ def detect_account(email: str, log: LogFn | None = None) -> dict:
         status = RISK_CLEAN
     else:
         status = RISK_UNKNOWN
+    reason = _format_detect_reason(info)
     public = upsert_account(
         email,
         sso=rec.get("sso") or "",
         risk_status=status,
-        risk_detail=str(info.get("reason") or ""),
+        risk_detail=reason,
         risk_checked_at=now,
         token_exp=_token_exp(token),
     )
     attempts = info.get("attempts") or []
     last = attempts[-1] if attempts else {}
-    reason = str(info.get("reason") or last.get("detail") or "")
     public["detect"] = {
         "ok": bool(info.get("ok")),
         "flagged": bool(info.get("flagged")),
@@ -166,6 +208,7 @@ def detect_account(email: str, log: LogFn | None = None) -> dict:
         "attempts": [
             {
                 "identity": att.get("identity") or "",
+                "exit_ip": att.get("exit_ip") or "",
                 "status": int(att.get("status") or 0),
                 "detail": att.get("detail") or "",
                 "verdict": att.get("verdict") or "",
@@ -482,6 +525,7 @@ def _record_detect_result(email: str, rec: dict | None, exc: Exception | None) -
         }
     detect = rec.get("detect") if isinstance(rec, dict) else {}
     unknown = str((rec or {}).get("risk_status") or "") == "unknown"
+    attempts = (detect or {}).get("attempts") or []
     return {
         "email": email,
         "ok": not unknown,
@@ -491,6 +535,7 @@ def _record_detect_result(email: str, rec: dict | None, exc: Exception | None) -
         "risk_status": (rec or {}).get("risk_status") or "",
         "flagged": bool((detect or {}).get("flagged")),
         "http_status": int((detect or {}).get("http_status") or 0),
+        "attempts": attempts,
     }
 
 

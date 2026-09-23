@@ -49,12 +49,6 @@ from playwright.sync_api._generated import Playwright as _SyncPlaywright
 
 from camoufox_adapter import CamoufoxBrowser, CamoufoxPage
 from batch_traffic import meter_proxy_url
-from fingerprint_profile import (
-    pick_fingerprint_screen,
-    pick_humanize_seconds,
-    pick_webgl_config,
-    try_screen_constraint,
-)
 from retry_policy import browser_start_attempts
 from secure_files import ensure_private_dir
 from socks_auth_relay import wrap_firefox_proxy
@@ -847,12 +841,12 @@ def create_browser_options(unique_profile=True) -> dict:
 
     反检测策略：
     - headless=False：有头模式（headless 更易被检测）
-    - humanize=随机秒数：人类化鼠标移动 + 贝塞尔轨迹
-    - geoip=True：基于代理 IP 匹配时区 / 语言 / 经纬度（不写死 locale）
-    - block_webrtc=False：让 Camoufox 把 WebRTC IP 伪造成出口，不要整段碰掉
+    - humanize=True：人类化鼠标移动 + 点击轨迹
+    - geoip=True：基于代理 IP 匹配时区 / 语言 / 经纬度
+    - block_webrtc=True：WebRTC IP 泄漏防护（避免真实 IP 通过 STUN 暴露）
     - os=windows：UA / Client Hints / 字体 / WebGL 渲染器按 Windows 配置文件对齐
-    - window/screen：每号随机常见 Win 分辨率（Xvfb 须更大）
-    - webgl_config：排除 WARP / SwiftShader
+      （宿主机即使是 Linux Xvfb 也不走 linux 指纹）
+    - 指纹由 BrowserForge 自动生成（匹配 Firefox/Camoufox 引擎）
     """
     # GROK_HEADLESS=1 forces headless (needed on some Windows sessions where
     # headed Camoufox dies with GPU process / SW-WR framebuffer crashes).
@@ -863,25 +857,16 @@ def create_browser_options(unique_profile=True) -> dict:
     force_headed = headed_env in {"1", "true", "yes", "on"}
     use_headless = bool(force_headless) and not force_headed
     browser_os = resolve_browser_os()
-    width, height = pick_fingerprint_screen()
-    humanize_s = pick_humanize_seconds()
-    webgl_config = pick_webgl_config(browser_os)
 
     opts: dict = {
         "headless": use_headless,  # default headed; set GROK_HEADLESS=1 on broken GPU sessions
-        "humanize": humanize_s,  # 鼠标贝塞尔；浮点为 maxTime 秒
-        "geoip": True,          # 基于 IP 匹配时区 / 经纬度
-        "locale": "en-US",      # UI 仍用英文，避免家宽出口（如基辅）把注册按钮译丢
-        "block_webrtc": False,  # 伪造 WebRTC IP=出口；整段 block 更像隐私浏览器
+        "humanize": True,       # 人类化鼠标移动 + 贝塞尔轨迹
+        "geoip": True,          # 基于 IP 匹配时区 / 语言 / 经纬度
+        "locale": "en-US",      # 与美西出口一致，避免 UI 语言漂移
+        "block_webrtc": True,   # 防止 WebRTC 泄漏真实 IP（即使使用代理）
         "os": browser_os,       # Windows 配置文件：UA + hints + 字体 + WebGL
-        "window": (width, height),
         "i_know_what_im_doing": True,  # 抑制 Firefox 版本伪装警告（Camoufox 引擎层伪装是预期行为）
     }
-    screen = try_screen_constraint(width, height)
-    if screen is not None:
-        opts["screen"] = screen
-    if webgl_config:
-        opts["webgl_config"] = webgl_config
     if use_headless or os.name == "nt":
         # Soften GPU requirements on Windows (headed or headless).
         opts["firefox_user_prefs"] = {
@@ -981,16 +966,6 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
             opts = create_browser_options(unique_profile=True)
             opts = _attach_firefox_proxy(opts, log_callback=log_callback)
             profile_dir = getattr(_tls, "profile_dir", None)
-            if log_callback:
-                win = opts.get("window") or ()
-                wg = opts.get("webgl_config") or ()
-                renderer = str(wg[1] if len(wg) > 1 else "")[:56]
-                webrtc = "block" if opts.get("block_webrtc") else "spoof"
-                size = f"{win[0]}x{win[1]}" if len(win) == 2 else "?"
-                log_callback(
-                    f"[*] 指纹配置 window={size} humanize={opts.get('humanize')}s "
-                    f"webrtc={webrtc} webgl={renderer or 'auto'}"
-                )
             if log_callback and isinstance(opts.get("geoip"), str):
                 log_callback(f"[Debug] geoip 使用预解析出口 IP: {opts['geoip']}")
 
